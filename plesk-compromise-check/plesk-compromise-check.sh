@@ -13,6 +13,7 @@
 #   plesk-compromise-check -d example.com    # only this subscription
 #   plesk-compromise-check -f                # full scan: grep every PHP file, not just recent ones (slow)
 #   plesk-compromise-check -W                # skip the WordPress checks
+#   plesk-compromise-check -v                # list every finding (default: 15 per category)
 #
 # Exit code: 0 = nothing found, 1 = review needed, 2 = likely compromise.
 # Run as a regular sudo user; the script re-runs itself with sudo when needed.
@@ -21,16 +22,16 @@
 
 set -uo pipefail
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo -- "$0" "$@"; fi
 export LC_ALL=C
 shopt -s nullglob
 
-SINCE=$(date -d '-30 days' +%F); DOM=""; FULL=0; WP_CHECK=1
-while getopts "s:d:fWh" o; do
+SINCE=$(date -d '-30 days' +%F); DOM=""; FULL=0; WP_CHECK=1; VERBOSE=0
+while getopts "s:d:fWvh" o; do
   case $o in
-    s) SINCE=$OPTARG ;; d) DOM=$OPTARG ;; f) FULL=1 ;; W) WP_CHECK=0 ;; *) usage ;;
+    s) SINCE=$OPTARG ;; d) DOM=$OPTARG ;; f) FULL=1 ;; W) WP_CHECK=0 ;; v) VERBOSE=1 ;; *) usage ;;
   esac
 done
 date -d "$SINCE" >/dev/null 2>&1 || { echo "Invalid date: $SINCE"; exit 1; }
@@ -138,17 +139,32 @@ main() {
     | grep -v '/wordfence/' | while IFS= read -r f; do add HIGH "$(site_of_path "$f")" webshell "$f"; done
 
   # ---------- files: PHP in upload folders ----------
+  # Plugins that legitimately keep PHP in uploads: icon font maps, mail/page-builder caches,
+  # page templates, firewall rules and PDF font metrics.
+  local known_uploads='/uploads/(smile_fonts/[^/]+/charmap\.php|mailpoet/cache/|fusion-builder-avada-pages/|aios/firewall-rules/|fonts/[^/]+\.php$|wpforms/cache/|et-cache/|bb-plugin/cache/)'
   find "${ROOTS[@]}" "${prune[@]}" -type f -path '*/wp-content/uploads/*' \
        \( -iname '*.php' -o -iname '*.phtml' -o -iname '*.php[0-9]' -o -iname '*.phar' \) -print 2>/dev/null \
     | while IFS= read -r f; do
         # WordPress drops tiny "silence is golden" index.php files; ignore those.
         [ "${f##*/}" = index.php ] && [ "$(stat -c %s "$f")" -lt 200 ] && continue
+        # Known plugin files that live in uploads: only flag them if they contain backdoor code.
+        if [[ "$f" =~ $known_uploads ]]; then
+          grep -qsE "$pat" "$f" && add HIGH "$(site_of_path "$f")" webshell "$f"
+          continue
+        fi
         add HIGH "$(site_of_path "$f")" upload_php "$f"
       done
 
   # ---------- files: hidden PHP ----------
   find "${ROOTS[@]}" "${prune[@]}" -type f -name '.*' \( -iname '*.php' -o -iname '*.phtml' -o -iname '*.php[0-9]' \) -print 2>/dev/null \
-    | grep -vE '/\.(php-cs-fixer|php_cs)' | while IFS= read -r f; do add MEDIUM "$(site_of_path "$f")" hidden_php "$f"; done
+    | while IFS= read -r f; do
+        case "${f##*/}" in ._*) continue ;; esac                      # macOS resource forks, not code
+        if [[ "$f" == */vendor/* ]]; then                            # dev tool files in libraries
+          grep -qsE "$pat" "$f" && add HIGH "$(site_of_path "$f")" webshell "$f"
+          continue
+        fi
+        add MEDIUM "$(site_of_path "$f")" hidden_php "$f"
+      done
 
   # ---------- auto_prepend / auto_append ----------
   {
@@ -157,7 +173,7 @@ main() {
     ls /opt/plesk/php/*/etc/php.ini /opt/plesk/php/*/etc/php.d/*.ini /opt/plesk/php/*/etc/php-fpm.d/*.conf /etc/php/*/*/php.ini /etc/php/*/*/conf.d/*.ini /etc/php/*/fpm/pool.d/*.conf 2>/dev/null
   } | sort -u | while IFS= read -r f; do
       grep -HnE '^[^;#]*(auto_prepend_file|auto_append_file)([[:space:]]*=[[:space:]]*|[[:space:]]+)"?[^"=[:space:];]+' "$f" 2>/dev/null \
-        | grep -viE 'wordfence-waf\.php|=[[:space:]]*"?none"?[[:space:]]*$|=[[:space:]]*""' \
+        | grep -viE '(wordfence-waf|ninjafirewall|admintools-waf|aios-bootstrap)\.php|=[[:space:]]*"?none"?[[:space:]]*$|=[[:space:]]*""' \
         | while IFS= read -r l; do add HIGH "$(site_of_path "$f")" prepend "$l"; done
     done
 
@@ -219,7 +235,7 @@ main() {
     done
   done
   for f in /etc/systemd/system/*.service /etc/systemd/system/*/*.service /lib/systemd/system/*.service; do
-    grep -HE '^Exec(Start|StartPre)=.*(/tmp/|/var/tmp/|/dev/shm/|'"$VHOSTS"'/)' "$f" 2>/dev/null \
+    grep -HE '^Exec(Start|StartPre)=[-@+!:]*(/tmp/|/var/tmp/|/dev/shm/|'"$VHOSTS"'/)' "$f" 2>/dev/null \
       | while IFS= read -r l; do add HIGH SERVER systemd "$l"; done
   done
 
@@ -277,7 +293,11 @@ main() {
         fi
         wpc core verify-checksums 2>&1 | sed -nE "s/^Warning: File doesn't verify against checksum: (.*)$/MOD \1/p; s/^Warning: File should not exist: (.*)$/EXTRA \1/p" \
           | while read -r kind f; do
-              [ "$kind" = MOD ] && add HIGH "$site" wp_core "$dir/$f (modified)" || add MEDIUM "$site" wp_core "$dir/$f (not part of WordPress)"
+              if [ "$kind" = MOD ]; then add HIGH "$site" wp_core "$dir/$f (modified)"; continue; fi
+              # Extra files: only PHP or extension-less files matter; .DS_Store, .htaccess, .orig, .zip etc. don't run.
+              b=${f##*/}
+              [ -s "$dir/$f" ] || continue                               # empty leftovers can't run anything
+              [[ "$b" =~ \.(php[0-9]?|phtml|phar)$ || "$b" != *.* ]] && add MEDIUM "$site" wp_core "$dir/$f (not part of WordPress)"
             done
       done
     fi
@@ -285,7 +305,7 @@ main() {
 
   # ---------- report ----------
   local high med
-  high=$(awk -F'\t' '$1 == "HIGH"' "$FINDINGS" | wc -l); med=$(awk -F'\t' '$1 == "MEDIUM"' "$FINDINGS" | wc -l)
+  high=$(awk -F'\t' '$1 == "HIGH"' "$FINDINGS" | sort -u | wc -l); med=$(awk -F'\t' '$1 == "MEDIUM"' "$FINDINGS" | sort -u | wc -l)
   echo
   if [ "$high" -eq 0 ] && [ "$med" -eq 0 ]; then
     echo "${G}${B}OK${N}: nothing suspicious found. This is not proof the server is clean, only that these checks found nothing."
@@ -296,11 +316,14 @@ main() {
     echo; echo "${B}=== $site ===${N}"
     awk -F'\t' -v s="$site" '$2 == s {print $3}' "$FINDINGS" | sort -u | while IFS= read -r cat; do
       echo "  ${B}[$cat]${N} $(explain "$cat")"
-      awk -F'\t' -v s="$site" -v c="$cat" '$2 == s && $3 == c {print $1 "\t" $4}' "$FINDINGS" | sort -u | while IFS=$'\t' read -r sev detail; do
+      local total; total=$(awk -F'\t' -v s="$site" -v c="$cat" '$2 == s && $3 == c' "$FINDINGS" | sort -u | wc -l)
+      awk -F'\t' -v s="$site" -v c="$cat" '$2 == s && $3 == c {print $1 "\t" $4}' "$FINDINGS" | sort -u \
+        | { if [ "$VERBOSE" = 1 ]; then cat; else head -15; fi; } | while IFS=$'\t' read -r sev detail; do
         [ "$sev" = HIGH ] && col=$R || col=$Y
         echo "    ${col}${sev}${N} $detail"
         case "$cat" in webshell|upload_php|hidden_php|wp_core) log_hits "${detail%% (*}" ;; esac
       done
+      [ "$VERBOSE" = 0 ] && [ "$total" -gt 15 ] && echo "    ... and $((total - 15)) more (run with -v to list all)"
     done
   done
 

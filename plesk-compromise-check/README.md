@@ -49,6 +49,7 @@ plesk-compromise-check -s 2026-10-01     # look back to a given date
 plesk-compromise-check -d example.com    # only this subscription
 plesk-compromise-check -f                # grep every PHP file, not only recently changed ones (slow)
 plesk-compromise-check -W                # skip the WordPress checks (faster)
+plesk-compromise-check -v                # list every finding (default: 15 per category)
 ```
 
 | Option | Meaning | Default |
@@ -57,6 +58,7 @@ plesk-compromise-check -W                # skip the WordPress checks (faster)
 | `-d DOMAIN` | Only scan this subscription | all |
 | `-f` | Full scan of all PHP files, regardless of change date | off |
 | `-W` | Skip the WordPress checks | off |
+| `-v` | List every finding instead of the first 15 per category | off |
 
 ## Result
 
@@ -67,6 +69,15 @@ plesk-compromise-check -W                # skip the WordPress checks (faster)
 | **LIKELY COMPROMISE** | 2 | At least one high finding. The script prints next steps. |
 
 Each finding comes with a short explanation of what it means. A copy of the report is saved in the home folder of the user who ran the script, e.g. `/home/ubuntu/plesk-compromise-check-<host>-<time>.txt`.
+
+## Known-good files
+
+To keep the report readable, some common, legitimate files are not reported on their own. They are still grepped for backdoor code, and reported as a webshell if they contain any:
+
+- PHP that plugins keep in `wp-content/uploads`: icon font maps (`smile_fonts/*/charmap.php`), MailPoet, WPForms, Divi and Beaver Builder caches, Avada page templates, All-In-One Security firewall rules and PDF font metrics (`uploads/fonts/*.php`)
+- Hidden PHP files inside `vendor/` folders (e.g. `.phpstorm.meta.php`) and macOS resource forks (`._*`)
+- `auto_prepend_file` pointing at a known WordPress firewall: Wordfence, NinjaFirewall, Admin Tools, All-In-One Security
+- Extra files in a WordPress install that can't run as PHP (`.DS_Store`, `.htaccess`, `.orig`, `.zip`) or are empty
 
 ## Good to know
 
