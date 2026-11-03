@@ -89,7 +89,7 @@ awk -F'"' '
   split($2, r, " "); m = r[1]; u = r[2]; sub(/\?.*/, "", u)
   split($3, s, " "); st = s[1]; ua = $6; lua = tolower(ua)
   n[d]++; ipc[d SUBSEP ip]++; uac[d SUBSEP ua]++; urc[d SUBSEP m " " u]++
-  if (u !~ /\.(css|js|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico|map|mp4|webm|mp3|pdf)$/) { dyn[d]++; dipc[d SUBSEP ip]++ }
+  if (u !~ /\.(css|js|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico|map|mp4|webm|mp3|pdf|html?|txt)$/) { dyn[d]++; dipc[d SUBSEP ip]++ }
   if (st == "401" || st == "403") e4[d]++
   if (st ~ /^5/) e5[d]++
   if (st == "429") rl[d]++
@@ -121,7 +121,7 @@ awk -F'\t' -v top="$TOP" -v mins="$MINS" '
     printf "   top URL: %-70.70s %6d\n", $7, $8
   }
   f = ""
-  if ($20 / mins >= 2 && $20 > 0.5 * $18) f = f sprintf("\n   ! One IP sends %d of %d dynamic (PHP) requests (%s)", $20, $18, $19)
+  if ($20 / mins >= 2 && $20 > 0.5 * $18) f = f sprintf("\n   ! One IP sends %d of %d dynamic requests (%s)", $20, $18, $19)
   if ($17 >= 50 && $17 * pct > 30) f = f sprintf("\n   ! Bots/agents/scripts: %d requests (%.0f%%)", $17, $17 * pct)
   if ($9 >= 50 && $9 * pct > 15)   f = f sprintf("\n   ! %d responses with 401/403, auth loop or blocked client?", $9)
   if ($16 >= 20)                    f = f sprintf("\n   ! %d MCP/OAuth requests, AI agent connected to the site?", $16)
