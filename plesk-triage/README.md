@@ -23,7 +23,7 @@ plesk-triage
 
 | Flag | What it usually means |
 |---|---|
-| `One IP accounts for X% of traffic` | A single client: an integration, a script or a scraper |
+| `One IP sends X of Y dynamic (PHP) requests` | A single client hammering PHP: an integration, a script or a scraper. Static files (images, CSS, JS) are not counted, so a normal visitor does not trigger it. |
 | `Bots/agents/scripts` | AI crawlers, SEO bots, AI agents, curl/python scripts |
 | `responses with 401/403` | A client failing to authenticate and retrying in a loop |
 | `MCP/OAuth requests` | An AI agent (e.g. Codex or Claude) connected to WordPress over MCP |

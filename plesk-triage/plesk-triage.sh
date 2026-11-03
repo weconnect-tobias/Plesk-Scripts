@@ -63,7 +63,7 @@ if [ "$SAMPLE" = 1 ]; then
     fi
   done < "$TMP/top" | awk '{c[$2]+=$1} END {for (k in c) printf "%7.1f %%  %s\n", c[k], k}' | sort -rn | head -"$TOP"
   echo "(100 % = one core. Workers per pool right now:)"
-  ps -eo args= | awk '/php-fpm: pool/ {c[$NF]++} END {for (k in c) printf "  %3d  %s\n", c[k], k}' | sort -rn | head -5
+  ps -eo args= | awk '/^php-fpm: pool / {c[$NF]++} END {for (k in c) printf "  %3d  %s\n", c[k], k}' | sort -rn | head -5
 fi
 
 # ---------- collect log lines ----------
@@ -89,6 +89,7 @@ awk -F'"' '
   split($2, r, " "); m = r[1]; u = r[2]; sub(/\?.*/, "", u)
   split($3, s, " "); st = s[1]; ua = $6; lua = tolower(ua)
   n[d]++; ipc[d SUBSEP ip]++; uac[d SUBSEP ua]++; urc[d SUBSEP m " " u]++
+  if (u !~ /\.(css|js|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico|map|mp4|webm|mp3|pdf)$/) { dyn[d]++; dipc[d SUBSEP ip]++ }
   if (st == "401" || st == "403") e4[d]++
   if (st ~ /^5/) e5[d]++
   if (st == "429") rl[d]++
@@ -104,9 +105,9 @@ function best(arr, d_,   k, p, bk, bv) { bv = 0
   BV = bv; return bk }
 END {
   for (d in n) {
-    tip = best(ipc, d); tipc = BV; tua = best(uac, d); tuac = BV; tur = best(urc, d); turc = BV
-    printf "%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", d, n[d], tip, tipc, tua, tuac, tur, turc,
-      e4[d], e5[d], rl[d], xr[d], wl[d], aj[d], wc[d], mc[d], bt[d]
+    tip = best(ipc, d); tipc = BV; tua = best(uac, d); tuac = BV; tur = best(urc, d); turc = BV; dip = best(dipc, d); dipcn = BV
+    printf "%s\t%d\t%s\t%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%d\n", d, n[d], tip, tipc, tua, tuac, tur, turc,
+      e4[d], e5[d], rl[d], xr[d], wl[d], aj[d], wc[d], mc[d], bt[d], dyn[d], dip, dipcn
   }
 }' "$HITS" | sort -t$'\t' -k2,2nr > "$TSV"
 
@@ -120,7 +121,7 @@ awk -F'\t' -v top="$TOP" -v mins="$MINS" '
     printf "   top URL: %-70.70s %6d\n", $7, $8
   }
   f = ""
-  if (rate >= 2 && $4 * pct > 50) f = f sprintf("\n   ! One IP accounts for %.0f%% of traffic (%s)", $4 * pct, $3)
+  if ($20 / mins >= 2 && $20 > 0.5 * $18) f = f sprintf("\n   ! One IP sends %d of %d dynamic (PHP) requests (%s)", $20, $18, $19)
   if ($17 >= 50 && $17 * pct > 30) f = f sprintf("\n   ! Bots/agents/scripts: %d requests (%.0f%%)", $17, $17 * pct)
   if ($9 >= 50 && $9 * pct > 15)   f = f sprintf("\n   ! %d responses with 401/403, auth loop or blocked client?", $9)
   if ($16 >= 20)                    f = f sprintf("\n   ! %d MCP/OAuth requests, AI agent connected to the site?", $16)
@@ -169,7 +170,8 @@ done
 
 # ---------- misc ----------
 h "Misc"
-off=$(grep -lE 'opcache\.enable\s*=\s*(0|off)' "$VH"/*/etc/php.ini 2>/dev/null | awk -F/ '{print $6}')
+inis=("$VH"/*/etc/php.ini)
+off=""; [ ${#inis[@]} -gt 0 ] && off=$(grep -lE 'opcache\.enable\s*=\s*(0|off)' "${inis[@]}" < /dev/null 2>/dev/null | awk -F/ '{print $(NF-2)}')
 if [ -n "$off" ]; then echo "OPcache disabled for:"; echo "$off" | sed 's/^/  /'; else echo "OPcache is not disabled for any domain."; fi
 echo "Response times are not logged in Plesk's default log format. Measure TTFB with:"
 echo "  curl -o /dev/null -s -w 'tls %{time_appconnect}  ttfb %{time_starttransfer}\n' https://DOMAIN/"
