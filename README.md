@@ -8,6 +8,7 @@ Small, standalone scripts for running and troubleshooting Plesk servers. Each sc
 |---|---|
 | [plesk-triage](plesk-triage/) | Finds out what is loading a slow Plesk server: CPU per PHP pool, traffic per domain, and flags for bots, AI agents, auth loops, brute force and broken crontabs. Read-only. |
 | [plesk-compromise-check](plesk-compromise-check/) | Looks for signs of a break-in: webshells, PHP in upload folders, prepend backdoors, shells spawned by PHP, malware in temp folders, rogue accounts and WordPress admins, modified core files. Read-only. |
+| [plesk-wp-integrity](plesk-wp-integrity/) | Checks every WordPress installation's core and wordpress.org plugins against official checksums via WP Toolkit, flags suspicious code, and can repair them. Check only by default; `--fix` asks first and saves everything for `--restore`. |
 | [plesk-cron-cleanup](plesk-cron-cleanup/) | Finds orphaned and wrong-owner crontabs left behind by deleted subscriptions, and moves them aside safely. Dry run by default. |
 
 ## Installing a script
@@ -35,7 +36,7 @@ Run the same command again to update. Read a script before you install it; they 
 All scripts in this repo follow the same rules:
 
 - **No root login required.** Scripts are run as a regular sudo user (e.g. `ubuntu`) and elevate themselves with `sudo` when needed.
-- **Read-only by default.** A script that only diagnoses never changes anything. A script that does change something says so clearly in its README and asks before acting.
+- **Read-only by default.** A script that only diagnoses never changes anything. A script that does change something says so clearly in its README, asks before acting, and never deletes: files are moved or saved so the change can be undone.
 - **One file, no dependencies.** Each script is a single Bash file that uses tools already present on a standard Plesk server.
 - **No customer data.** Examples use `example.com`. Never commit log excerpts, IP addresses, domain names or credentials.
 
