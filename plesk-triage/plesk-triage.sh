@@ -162,18 +162,18 @@ fi   # PROBES_ONLY
 
 # ---------- scanners and probes ----------
 h "Scanners and probes ($WIN${DOM:+, $DOM})"
-awk -F'"' -v top="$TOP" -v single="${DOM:+1}" '
+awk -F'"' -v top="$TOP" -v single="${DOM:+1}" -v benign='^/(wp-links-opml\.php|wp-trackback\.php|wp-sitemap[^/]*\.xml|sitemap[^/]*\.xml|feed|comments/feed|\.well-known/(security\.txt|traffic-advice))$|\.(rss|xml)$' '
 function isdyn(x) { return x !~ /\.(css|js|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico|map|mp4|webm|mp3|pdf|html?)$/ }
 {
   split($1, a, " "); d = a[1]; ip = a[2]
-  split($2, r, " "); u = r[2]; sub(/\?.*/, "", u)
+  split($2, r, " "); u = r[2]; sub(/\?.*/, "", u); gsub(/\/\/+/, "/", u)
   split($3, s, " "); st = s[1]; ua = $6
   if (!(ip SUBSEP d in seen)) { seen[ip SUBSEP d] = 1; sites[ip]++ }
   if (!(ip in firstua)) firstua[ip] = ua
   if (isdyn(u)) {
     dyn[ip]++
     if (st ~ /^4/) e4[ip]++
-    if (st == "200" && u != "/" && u !~ /(^|\/)index\.php$/ && u !~ /^\/(wp-cron|wp-login|xmlrpc|robots)/ && u !~ /^\/wp-(admin|json|includes)\// && u !~ /\/$/ && u !~ /\/(readme|changelog|change_log|CHANGELOG|README)\.(txt|md)$/)
+    if (st == "200" && u != "/" && u !~ /(^|\/)index\.php$/ && u !~ /^\/(wp-cron|wp-login|xmlrpc|robots)/ && u !~ /^\/wp-(admin|json|includes)\// && u !~ /^\/xmlrpc\.php$/ && u !~ /\/$/ && u !~ /\/(readme|changelog|change_log|CHANGELOG|README)\.(txt|md)$/ && u !~ benign)
       ok[ip SUBSEP d " " u]++
   }
   # Version-check files: browsers never load these, scanners do.
