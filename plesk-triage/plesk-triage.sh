@@ -4,6 +4,8 @@
 # Reads the Apache and nginx logs for every domain, measures CPU per PHP-FPM pool
 # and flags common problems: one IP dominating, AI agents/MCP, auth loops (401/403),
 # xmlrpc/wp-login attacks, admin-ajax/wp-cron hammering, broken crontabs and more.
+# Also lists vulnerability scanners, the plugins/themes they probed for, and any probe
+# that found something (worth checking that plugin's version).
 #
 # Usage:
 #   plesk-triage                     # last 60 minutes, all domains
@@ -11,23 +13,24 @@
 #   plesk-triage -H 02/Nov/2026:14   # a specific hour (also searches rotated logs)
 #   plesk-triage -d example.com      # deep dive into one domain
 #   plesk-triage -n 20 -S            # top 20, skip the CPU sample
+#   plesk-triage -P -H 06/Nov/2026   # scanners and probes only, for a whole day
 #
 # Run as a regular sudo user; the script re-runs itself with sudo when needed.
 # Read-only, changes nothing. MIT license.
 
 set -uo pipefail
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo -- "$0" "$@"; fi
 export LC_ALL=C
 shopt -s nullglob
 
-MIN=60; HOUR=""; DOM=""; TOP=10; SAMPLE=1
-while getopts "m:H:d:n:Sh" o; do
+MIN=60; HOUR=""; DOM=""; TOP=10; SAMPLE=1; PROBES_ONLY=0
+while getopts "m:H:d:n:SPh" o; do
   case $o in
     m) MIN=$OPTARG ;; H) HOUR=$OPTARG ;; d) DOM=$OPTARG ;; n) TOP=$OPTARG ;;
-    S) SAMPLE=0 ;; *) usage ;;
+    S) SAMPLE=0 ;; P) PROBES_ONLY=1; SAMPLE=0 ;; *) usage ;;
   esac
 done
 
@@ -38,17 +41,20 @@ h() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 
 # ---------- time window ----------
 if [ -n "$HOUR" ]; then
-  echo "[$HOUR" > "$PAT"; MINS=60; WIN="hour $HOUR"
+  echo "[$HOUR" > "$PAT"
+  if [[ "$HOUR" == *:* ]]; then MINS=60; WIN="hour $HOUR"; else MINS=1440; WIN="day $HOUR"; fi
 else
   for i in $(seq 0 $((MIN - 1))); do date -d "-$i min" '+[%d/%b/%Y:%H:%M'; done > "$PAT"
   MINS=$MIN; WIN="last $MIN min"
 fi
 
 # ---------- system ----------
+if [ "$PROBES_ONLY" = 0 ]; then
 h "System ($(hostname), $(date '+%F %T'))"
 echo "Cores: $(nproc)   $(uptime | sed 's/.*load average/load average/')"
 top -b -n1 | sed -n '3,4p'
 echo "(Rule of thumb: load above core count = queueing. High 'sy' = kernel work, high 'wa' = disk.)"
+fi
 
 # ---------- CPU per pool ----------
 if [ "$SAMPLE" = 1 ]; then
@@ -79,8 +85,9 @@ for dir in "$VH"/${DOM:-*}/logs; do
 done > "$HITS"
 TOTAL=$(wc -l < "$HITS")
 
+if [ "$TOTAL" -eq 0 ]; then h "Traffic ($WIN)"; echo "No log lines in this window."; else
+if [ "$PROBES_ONLY" = 0 ]; then
 h "Traffic per domain ($WIN, $TOTAL requests total, Apache + nginx)"
-if [ "$TOTAL" -eq 0 ]; then echo "No log lines in this window."; else
 
 # ---------- single pass: stats + flags per domain ----------
 awk -F'"' '
@@ -150,6 +157,61 @@ if [ -n "$DOM" ]; then
   echo "--- Status codes";  awk -F'"' '{split($3,s," "); print s[1]}' "$HITS" | sort | uniq -c | sort -rn
   echo "--- Requests per minute (last 15)"
   awk '{print substr($5,14,5)}' "$HITS" | sort | uniq -c | tail -15
+fi
+fi   # PROBES_ONLY
+
+# ---------- scanners and probes ----------
+h "Scanners and probes ($WIN${DOM:+, $DOM})"
+awk -F'"' -v top="$TOP" -v single="${DOM:+1}" '
+function isdyn(x) { return x !~ /\.(css|js|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico|map|mp4|webm|mp3|pdf|html?)$/ }
+{
+  split($1, a, " "); d = a[1]; ip = a[2]
+  split($2, r, " "); u = r[2]; sub(/\?.*/, "", u)
+  split($3, s, " "); st = s[1]; ua = $6
+  if (!(ip SUBSEP d in seen)) { seen[ip SUBSEP d] = 1; sites[ip]++ }
+  if (!(ip in firstua)) firstua[ip] = ua
+  if (isdyn(u)) {
+    dyn[ip]++
+    if (st ~ /^4/) e4[ip]++
+    if (st == "200" && u != "/" && u !~ /(^|\/)index\.php$/ && u !~ /^\/(wp-cron|wp-login|xmlrpc|robots)/ && u !~ /^\/wp-(admin|json|includes)\// && u !~ /\/$/ && u !~ /\/(readme|changelog|change_log|CHANGELOG|README)\.(txt|md)$/)
+      ok[ip SUBSEP d " " u]++
+  }
+  # Version-check files: browsers never load these, scanners do.
+  if (match(u, /^\/wp-content\/(plugins|themes)\/[^\/]+\/(readme|changelog|change_log|CHANGELOG|README)\.(txt|md)$/)) {
+    slug = u; sub(/^\/wp-content\//, "", slug); sub(/\/[^\/]+$/, "", slug)
+    probe[slug]++
+    if (!(slug SUBSEP d in pseen)) { pseen[slug SUBSEP d] = 1; psites[slug]++ }
+    if (st == "200" && !(slug SUBSEP d in fseen)) { fseen[slug SUBSEP d] = 1; found[slug] = found[slug] " " d }
+  }
+}
+END {
+  # Scanner: mostly 4xx on dynamic requests, or many sites with a high 4xx share.
+  for (ip in dyn) {
+    p = 100 * e4[ip] / dyn[ip]
+    if ((dyn[ip] >= (single ? 8 : 15) && p >= 60) || (sites[ip] >= 5 && dyn[ip] >= 10 && p >= 50)) {
+      sc[ip] = 1; nsc++
+      printf "S\t%d\t%d\t%.0f\t%s\t%.50s\n", dyn[ip], sites[ip], p, ip, firstua[ip]
+    }
+  }
+  for (k in ok) { split(k, q, SUBSEP); if (q[1] in sc) printf "H\t%d\t%s\t%s\n", ok[k], q[1], q[2] }
+  for (sl in probe) printf "P\t%d\t%d\t%s\t%s\n", probe[sl], psites[sl], sl, found[sl]
+}' "$HITS" > "$TMP/probes"
+
+if ! grep -q '^S' "$TMP/probes"; then
+  echo "No scanners found (IPs with mostly 404/400/403 on dynamic requests)."
+else
+  echo "--- Scanner IPs (dynamic requests, sites hit, % 4xx, first user agent)"
+  awk -F'\t' '$1 == "S" {printf "%7d %4d sites %4d%%  %-40s %s\n", $2, $3, $4, $5, $6}' "$TMP/probes" | sort -rn | head -"$TOP"
+  echo "--- What scanners got a 200 on (check these; '/', index.php, wp-admin, wp-json are left out)"
+  if grep -q '^H' "$TMP/probes"; then
+    awk -F'\t' '$1 == "H" {printf "%5d  %-40s %s\n", $2, $3, $4}' "$TMP/probes" | sort -rn | head -"$TOP"
+  else echo "  nothing: every probe failed"; fi
+fi
+if grep -q '^P' "$TMP/probes"; then
+  echo "--- Plugins/themes probed via readme/changelog (FOUND = the file exists on that site)"
+  awk -F'\t' '$1 == "P" {printf "%d\t%5d %4d sites  %-45s %s\n", ($5 != "" ? 0 : 1), $2, $3, $4, ($5 != "" ? "FOUND on:" $5 : "not found")}' "$TMP/probes" \
+    | sort -t$'\t' -k1,1n -k2,2nr | cut -f2- | head -"$((TOP * 2))"
+  echo "(A FOUND plugin is not necessarily vulnerable, but scanners look for specific versions. Check it is up to date.)"
 fi
 fi
 

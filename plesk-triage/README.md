@@ -17,6 +17,7 @@ plesk-triage
 | **Traffic per domain** | Request count, top IP, top user agent and top URL, from both the Apache and nginx logs |
 | **Flags** | Warnings for common problems, see the table below |
 | **Cron** | Whether the cron daemon uses an abnormal amount of CPU, and crontabs with the wrong owner or no matching user |
+| **Scanners and probes** | IPs that mostly get 404/400/403 (vulnerability scanners), what they got a 200 on, and which plugins/themes they probed for, with FOUND when the plugin exists on a site |
 | **OPcache** | Domains where OPcache is disabled |
 
 ### Flags
@@ -57,15 +58,17 @@ plesk-triage -H 02/Nov/2026:14   # a specific hour, also searches rotated logs
 plesk-triage -d example.com      # deep dive into one domain
 plesk-triage -n 20               # show top 20 instead of top 10
 plesk-triage -S                  # skip the CPU sample (faster)
+plesk-triage -P -H 06/Nov/2026   # scanners and probes only, for a whole day
 ```
 
 | Option | Meaning | Default |
 |---|---|---|
 | `-m MIN` | Time window in minutes back from now | 60 |
-| `-H HOUR` | A specific hour in log format, e.g. `02/Nov/2026:14` | – |
+| `-H HOUR` | A specific hour (`02/Nov/2026:14`) or a whole day (`02/Nov/2026`) in log format | – |
 | `-d DOMAIN` | Only this domain, with detailed top lists | all |
 | `-n COUNT` | Number of rows in the top lists | 10 |
 | `-S` | Skip the CPU sample | – |
+| `-P` | Only the scanners and probes section (combine with `-H` for a day, or `-d` for one site) | – |
 
 ## Reading the output
 
@@ -74,6 +77,14 @@ plesk-triage -S                  # skip the CPU sample (faster)
    - High CPU **and** lots of traffic: check the flags and the top IP/UA. The traffic explains the load.
    - High CPU but **little** traffic: the site is heavy per request (plugins, theme). Continue with `-d DOMAIN`.
 3. **Check the flags.** They usually point straight at the cause.
+
+## Scanners and probes
+
+Bots constantly scan WordPress sites for known vulnerable plugins and for webshells left by other attackers. Most of it is harmless noise; what matters is whether anything was found. The section shows:
+
+- **Scanner IPs:** IPs whose dynamic requests mostly got 404/400/403, with how many sites they hit.
+- **What scanners got a 200 on:** paths that existed. Most are harmless pages, but a `.php` file you don't recognise here is worth a look with `plesk-compromise-check`.
+- **Plugins/themes probed:** scanners check a plugin's `readme.txt` or `changelog.txt` to learn its version. Browsers never load those files, so each request is a probe. **FOUND** means the plugin exists on that site, and scanners are interested in it: make sure it is up to date.
 
 ## Good to know
 
