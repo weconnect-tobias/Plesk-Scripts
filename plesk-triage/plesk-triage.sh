@@ -162,7 +162,11 @@ fi   # PROBES_ONLY
 
 # ---------- scanners and probes ----------
 h "Scanners and probes ($WIN${DOM:+, $DOM})"
-awk -F'"' -v top="$TOP" -v single="${DOM:+1}" -v benign='^/(wp-links-opml\.php|wp-trackback\.php|wp-sitemap[^/]*\.xml|sitemap[^/]*\.xml|feed|comments/feed|\.well-known/(security\.txt|traffic-advice))$|\.(rss|xml)$' '
+# Harmless WordPress/core endpoints that always answer 200. Passed via the environment
+# because awk -v would interpret the backslashes.
+BENIGN='^/(wp-load\.php|wp-links-opml\.php|wp-trackback\.php|wp-sitemap[^/]*\.xml|sitemap[^/]*\.xml|feed|comments/feed|\.well-known/(security\.txt|traffic-advice))$|\.(rss|xml)$' \
+awk -F'"' -v top="$TOP" -v single="${DOM:+1}" '
+BEGIN { benign = ENVIRON["BENIGN"] }
 function isdyn(x) { return x !~ /\.(css|js|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico|map|mp4|webm|mp3|pdf|html?)$/ }
 {
   split($1, a, " "); d = a[1]; ip = a[2]
