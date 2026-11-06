@@ -23,7 +23,7 @@ plesk-triage
 
 | Flag | What it usually means |
 |---|---|
-| `One IP sends X of Y dynamic (PHP) requests` | A single client hammering PHP: an integration, a script or a scraper. Static files (images, CSS, JS) are not counted, so a normal visitor does not trigger it. |
+| `One IP sends X of Y dynamic requests` | A single client hammering PHP: an integration, a script or a scraper. Static files (images, CSS, JS, HTML, PDF) are not counted, so a normal visitor does not trigger it. |
 | `Bots/agents/scripts` | AI crawlers, SEO bots, AI agents, curl/python scripts |
 | `responses with 401/403` | A client failing to authenticate and retrying in a loop |
 | `MCP/OAuth requests` | An AI agent (e.g. Codex or Claude) connected to WordPress over MCP |
@@ -79,6 +79,7 @@ plesk-triage -S                  # skip the CPU sample (faster)
 
 - **PHP traffic is logged by Apache, not nginx.** Plesk's proxy blocks have `access_log off`, so PHP requests only show up in Apache's `access_ssl_log`. The script reads both.
 - **Requests still running don't show up yet.** A log line is written when the request finishes, so long requests appear afterwards.
+- **Top IPs in `-d` shows two numbers:** all requests and dynamic requests (pages that run PHP). A normal visitor has many requests but few dynamic ones, since one page view loads dozens of images and scripts. A bot or script usually has almost only dynamic requests. The list is sorted by dynamic requests.
 - **Requests stopped in nginx** (e.g. by a rate limit in a block with `access_log off`) are not logged at all.
 - **Response times are not logged** in Plesk's default format. Measure them separately:
   ```bash

@@ -139,11 +139,14 @@ END { if (nw) { print "\n--- Flagged domains outside the top list"; for (i = 1; 
 # ---------- deep dive ----------
 if [ -n "$DOM" ]; then
   h "Details for $DOM"
-  echo "--- Top IPs";       awk '{print $2}' "$HITS" | sort | uniq -c | sort -rn | head -"$TOP"
+  echo "--- Top IPs (all requests / dynamic requests, sorted by dynamic)"
+  awk -F'"' '{ split($1, a, " "); ip = a[2]; split($2, r, " "); u = r[2]; sub(/\?.*/, "", u); all[ip]++
+               if (u !~ /\.(css|js|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico|map|mp4|webm|mp3|pdf|html?|txt)$/) dyn[ip]++ }
+             END { for (i in all) printf "%7d %7d  %s\n", all[i], dyn[i], i }' "$HITS" | sort -k2,2nr -k1,1nr | head -"$TOP"
   echo "--- Top user agents"; awk -F'"' '{print $6}' "$HITS" | sort | uniq -c | sort -rn | head -"$TOP"
-  echo "--- Top URLs (excluding static files)"
+  echo "--- Top dynamic URLs (static files, HTML and PDF excluded)"
   awk -F'"' '{split($2,r," "); u=r[2]; sub(/\?.*/,"",u); split($3,s," "); print r[1], u, s[1]}' "$HITS" \
-    | grep -vE '\.(css|js|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|ico|map) ' | sort | uniq -c | sort -rn | head -"$TOP"
+    | grep -vE '\.(css|js|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico|map|mp4|webm|mp3|pdf|html?|txt) ' | sort | uniq -c | sort -rn | head -"$TOP"
   echo "--- Status codes";  awk -F'"' '{split($3,s," "); print s[1]}' "$HITS" | sort | uniq -c | sort -rn
   echo "--- Requests per minute (last 15)"
   awk '{print substr($5,14,5)}' "$HITS" | sort | uniq -c | tail -15
