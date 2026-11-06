@@ -29,7 +29,7 @@ set -uo pipefail
 
 usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
-if [ "$(id -u)" -ne 0 ]; then exec sudo -- "$0" "$@"; fi
+if [ "$(id -u)" -ne 0 ]; then exec sudo --preserve-env=PWI_DEBUG,PWI_QUARANTINE -- "$0" "$@"; fi
 export LC_ALL=C
 
 FIX=0; YES=0; DOM=""; IID=""; RESTORE=""; PLUGINS=1
@@ -156,8 +156,8 @@ for line in "${INST[@]}"; do
         grep -qsE "$SUSP" "$pdir/$file" && P_SUSP[$slug]+="$file"$'\n'
       fi
     done < <(grep -E '^[^,]+,[^,]+,(Checksum does not match|File was added|File is missing)$|^plugin_name,' <<< "$pout")
-    mapfile -t P_SKIP < <(sed -nE 's#.*plugin-checksums/([^/]+)/([^/]+)\.json.*#\1 \2#p' <<< "$pout"; \
-                          sed -nE 's/.*Could not retrieve the checksums for version ([^ ]+) of plugin ([^,]+),.*/\2 \1/p' <<< "$pout")
+    mapfile -t P_SKIP < <({ sed -nE 's#.*plugin-checksums/([^/]+)/([^/]+)\.json.*#\1 \2#p' <<< "$pout"
+                            sed -nE 's/.*Could not retrieve the checksums for version ([^ ]+) of plugin ([^,]+),.*/\2 \1/p' <<< "$pout"; } | awk '!s[$1]++')
   fi
 
   issues=$(( ${#C_MOD[@]} + ${#C_EXTRA[@]} + ${#C_MISS[@]} + ${#P_LIST[@]} ))
