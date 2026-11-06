@@ -65,6 +65,9 @@ wpt() {
     | awk '!seen[$0]++'
 }
 
+# PWI_DEBUG=1 shows the raw (cleaned) wp-cli output for each installation.
+dbg() { [ -n "${PWI_DEBUG:-}" ] && { echo "  --- debug: $1"; printf '%s\n' "$2" | sed 's/^/  | /'; } >&2; return 0; }
+
 record() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$Q/manifest.tsv"; }   # action original saved
 
 # Save a copy of a file before it is overwritten.
@@ -125,6 +128,7 @@ for line in "${INST[@]}"; do
 
   # ---------- core ----------
   core=$(wpt "$id" core verify-checksums)
+  dbg "core verify-checksums" "$core"
   mapfile -t C_MOD   < <(sed -nE "s/^Warning: File doesn't verify against checksum: (.*)$/\1/p" <<< "$core")
   mapfile -t C_EXTRA < <(sed -nE "s/^Warning: File should not exist: (.*)$/\1/p" <<< "$core")
   mapfile -t C_MISS  < <(sed -nE "s/^Warning: File doesn't exist: (.*)$/\1/p" <<< "$core" | grep -vE "$OPTIONAL_CORE")
@@ -134,7 +138,9 @@ for line in "${INST[@]}"; do
   declare -A P_MOD=() P_ADD=() P_MISS=() P_PHP=() P_SUSP=()
   P_LIST=(); P_SKIP=()
   if [ "$PLUGINS" = 1 ]; then
-    pout=$(wpt "$id" plugin verify-checksums --all --format=csv)
+    # wp-cli quotes CSV fields that contain spaces ("Checksum does not match"); drop the quotes.
+    pout=$(wpt "$id" plugin verify-checksums --all --format=csv | sed 's/"//g')
+    dbg "plugin verify-checksums" "$pout"
     while IFS=, read -r slug file msg; do
       [ "$slug" = plugin_name ] && continue
       [ -z "${P_MOD[$slug]+x}" ] && { P_LIST+=("$slug"); P_MOD[$slug]=0; P_ADD[$slug]=0; P_MISS[$slug]=0; P_PHP[$slug]=""; P_SUSP[$slug]=""; }
@@ -219,7 +225,7 @@ for line in "${INST[@]}"; do
     tar -czpf "$arc" -C "$root/wp-content/plugins" "$slug" && record plugin "$pdir" "$arc"
     wpt "$id" plugin install "$slug" --version="$pver" --force | sed 's/^/    /'
     # Files that are still not part of the official plugin go to quarantine.
-    wpt "$id" plugin verify-checksums "$slug" --format=csv | awk -F, '$3 == "File was added" {print $2}' \
+    wpt "$id" plugin verify-checksums "$slug" --format=csv | sed 's/"//g' | awk -F, '$3 == "File was added" {print $2}' \
       | while IFS= read -r f; do quarantine "$pdir/$f"; done
   done
 
