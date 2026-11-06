@@ -212,8 +212,12 @@ if grep -q '^P' "$TMP/probes"; then
   awk -F'\t' '$1 == "P" {printf "%d\t%5d %4d sites  %-45s %s\n", ($5 != "" ? 0 : 1), $2, $3, $4, ($5 != "" ? "FOUND on:" $5 : "not found")}' "$TMP/probes" \
     | sort -t$'\t' -k1,1n -k2,2nr | cut -f2- | head -"$((TOP * 2))"
   echo "(A FOUND plugin is not necessarily vulnerable, but scanners look for specific versions. Check it is up to date.)"
+else
+  echo "--- No plugin/theme probes (readme/changelog requests) in this window."
 fi
 fi
+
+[ "$PROBES_ONLY" = 1 ] && exit 0
 
 # ---------- cron ----------
 h "Cron"
