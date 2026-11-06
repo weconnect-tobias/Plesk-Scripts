@@ -12,6 +12,7 @@
 #   plesk-wp-integrity --core-only          # skip the plugin check (faster)
 #   plesk-wp-integrity --fix -d example.com # repair: show the plan, ask, then repair
 #   plesk-wp-integrity --fix --yes          # repair without asking (all installations!)
+#   plesk-wp-integrity --remove-inactive -d example.com  # remove inactive plugins (asks first)
 #   plesk-wp-integrity --restore DIR        # undo a repair, using its quarantine folder
 #
 # What --fix does (nothing is deleted):
@@ -19,6 +20,8 @@
 #   - extra files in wp-admin, wp-includes and the root: moved to quarantine
 #   - wordpress.org plugins with modified files: reinstalled, same version
 #   - files a plugin should not have: moved to quarantine
+# What --remove-inactive does: inactive plugins are archived, then removed from the site.
+#   Their settings in the database are kept, so a restored plugin works as before.
 #   Every file that is replaced or moved is saved under /var/backups/plesk-wp-integrity/<time>/
 #   first, and --restore puts it all back.
 # Never touched: plugins not on wordpress.org (premium/custom), themes, uploads, wp-config.php.
@@ -27,15 +30,16 @@
 
 set -uo pipefail
 
-usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo --preserve-env=PWI_DEBUG,PWI_QUARANTINE -- "$0" "$@"; fi
 export LC_ALL=C
 
-FIX=0; YES=0; DOM=""; IID=""; RESTORE=""; PLUGINS=1
+FIX=0; RMI=0; YES=0; DOM=""; IID=""; RESTORE=""; PLUGINS=1
 while [ $# -gt 0 ]; do
   case $1 in
     --fix) FIX=1 ;;
+    --remove-inactive) RMI=1 ;;
     --yes|-y) YES=1 ;;
     -d) DOM=${2:-}; shift ;;
     -i) IID=${2:-}; shift ;;
@@ -63,6 +67,14 @@ wpt() {
   plesk ext wp-toolkit --wp-cli -instance-id "$id" -- "$@" < /dev/null 2>&1 \
     | grep -vE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:.]+\]|^(PHP )?Deprecated: |^exit status [0-9]+$|^[[:space:]]*$' \
     | awk '!seen[$0]++'
+}
+
+# Is the plugin still available on wordpress.org? Prints "closed", "ok" or "unknown".
+# Closed plugins can't be reinstalled and get no more updates (often closed for security reasons).
+wporg_status() {
+  local r
+  r=$(curl -fsS -m 10 "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&request%5Bslug%5D=$1&request%5Bfields%5D%5Bsections%5D=0" 2>/dev/null) || { echo unknown; return; }
+  case $r in *'"error":"closed"'*|*'"closed":true'*) echo closed ;; *'"slug":'*) echo ok ;; *) echo unknown ;; esac
 }
 
 # PWI_DEBUG=1 shows the raw (cleaned) wp-cli output for each installation.
@@ -98,7 +110,9 @@ fi
 
 command -v plesk >/dev/null 2>&1 || { echo "plesk command not found: this script needs Plesk with WP Toolkit."; exit 1; }
 
-echo "${B}plesk-wp-integrity${N}  host=$(hostname -f 2>/dev/null || hostname)  $(date '+%F %T')  mode=$([ "$FIX" = 1 ] && echo fix || echo check)"
+ACT=$(( FIX || RMI ))
+mode=check; [ "$FIX" = 1 ] && mode=fix; [ "$RMI" = 1 ] && mode="$mode+remove-inactive"; mode=${mode#check+}
+echo "${B}plesk-wp-integrity${N}  host=$(hostname -f 2>/dev/null || hostname)  $(date '+%F %T')  mode=$mode"
 mapfile -t INST < <(plesk ext wp-toolkit --list 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {
   u = ""; for (i = 1; i <= NF; i++) if ($i ~ /^https?:\/\//) u = $i; print $1 "\t" u }')
 [ ${#INST[@]} -gt 0 ] || { echo "WP Toolkit lists no installations."; exit 0; }
@@ -135,7 +149,7 @@ for line in "${INST[@]}"; do
   core_err=$(grep -E '^Error: ' <<< "$core" | grep -v "doesn't verify against checksums" | head -1)
 
   # ---------- plugins ----------
-  declare -A P_MOD=() P_ADD=() P_MISS=() P_PHP=() P_SUSP=()
+  declare -A P_MOD=() P_ADD=() P_MISS=() P_PHP=() P_SUSP=() P_CLOSED=()
   P_LIST=(); P_SKIP=()
   if [ "$PLUGINS" = 1 ]; then
     # wp-cli quotes CSV fields that contain spaces ("Checksum does not match"); drop the quotes.
@@ -160,7 +174,16 @@ for line in "${INST[@]}"; do
                             sed -nE 's/.*Could not retrieve the checksums for version ([^ ]+) of plugin ([^,]+),.*/\2 \1/p' <<< "$pout"; } | awk '!s[$1]++')
   fi
 
+  # Inactive plugins: never run, but their files can still be reached and exploited.
+  declare -A INACT=()
+  pdir_base="$root/wp-content/plugins"
+  while IFS= read -r slug; do
+    [ -n "$slug" ] && { [ -d "$pdir_base/$slug" ] || [ -f "$pdir_base/$slug.php" ]; } && INACT[$slug]=1
+  done < <(wpt "$id" plugin list --status=inactive --field=name | grep -E '^[A-Za-z0-9._-]+$')
+  mapfile -t INACT_LIST < <(printf '%s\n' "${!INACT[@]}" | grep . | sort)
+
   issues=$(( ${#C_MOD[@]} + ${#C_EXTRA[@]} + ${#C_MISS[@]} + ${#P_LIST[@]} ))
+  [ "$RMI" = 1 ] && issues=$((issues + ${#INACT_LIST[@]}))
   if [ "$issues" -eq 0 ] && [ -z "$core_err" ]; then continue; fi
   DIRTY=$((DIRTY + 1))
 
@@ -179,10 +202,15 @@ for line in "${INST[@]}"; do
   for slug in "${P_LIST[@]}"; do
     nphp=$(printf '%s' "${P_PHP[$slug]}" | grep -c .)
     note=""
+    if [ "$(wporg_status "$slug")" = closed ]; then
+      P_CLOSED[$slug]=1
+      note=" ${R}CLOSED on wordpress.org: no more updates, remove or replace it${N}"
+    fi
     # Every file differing, including CSS/JS, almost always means a different version
     # than wordpress.org has checksums for, not an injected backdoor.
     total_mod=$((P_MOD[$slug] + P_ADD[$slug]))
-    [ "$total_mod" -gt "$nphp" ] && [ "$total_mod" -ge 5 ] && note=" ${Y}(non-PHP files differ too: probably a different version)${N}"
+    [ -z "${P_CLOSED[$slug]+x}" ] && [ "$total_mod" -gt "$nphp" ] && [ "$total_mod" -ge 5 ] && note=" ${Y}(non-PHP files differ too: different version or line endings)${N}"
+    [ -n "${INACT[$slug]+x}" ] && note="$note ${Y}(inactive)${N}"
     echo "  ${Y}plugin${N} $slug: ${P_MOD[$slug]} modified, ${P_ADD[$slug]} added, ${P_MISS[$slug]} missing, $nphp PHP$note"
     if [ -n "${P_SUSP[$slug]}" ]; then
       printf '%s' "${P_SUSP[$slug]}" | sed "s/^/    ${R}SUSPICIOUS CODE${N} /"
@@ -191,18 +219,25 @@ for line in "${INST[@]}"; do
     fi
     FINDINGS=$((FINDINGS + 1))
   done
+  [ ${#INACT_LIST[@]} -gt 0 ] && echo "  inactive plugins: $(printf '%s, ' "${INACT_LIST[@]}" | sed 's/, $//')"
   [ ${#P_SKIP[@]} -gt 0 ] && echo "  not on wordpress.org, not checked: $(printf '%s ' "${P_SKIP[@]}" | awk '{for (i = 1; i <= NF; i += 2) printf "%s%s", (i > 1 ? ", " : ""), $i}')"
 
   # ---------- fix ----------
-  [ "$FIX" = 1 ] || continue
-  plan=()
+  [ "$ACT" = 1 ] || continue
+  plan=(); fixable=(); removable=()
+  if [ "$RMI" = 1 ]; then
+    for slug in "${INACT_LIST[@]}"; do removable+=("$slug"); plan+=("remove inactive plugin $slug (archived first)"); done
+  fi
+  if [ "$FIX" = 1 ]; then
   [ $(( ${#C_MOD[@]} + ${#C_MISS[@]} )) -gt 0 ] && plan+=("reinstall WordPress $ver core files (modified ones are saved first)")
   [ ${#C_EXTRA[@]} -gt 0 ] && plan+=("move ${#C_EXTRA[@]} extra core file(s) to quarantine")
-  fixable=()
   for slug in "${P_LIST[@]}"; do
-    if [ -d "$root/wp-content/plugins/$slug" ]; then fixable+=("$slug"); plan+=("reinstall plugin $slug from wordpress.org, same version (old copy saved)")
+    if [ "$RMI" = 1 ] && [ -n "${INACT[$slug]+x}" ]; then continue   # being removed instead
+    elif [ -n "${P_CLOSED[$slug]+x}" ]; then echo "  ${Y}plugin $slug is closed on wordpress.org and can't be reinstalled; remove or replace it${N}"
+    elif [ -d "$root/wp-content/plugins/$slug" ]; then fixable+=("$slug"); plan+=("reinstall plugin $slug from wordpress.org, same version (old copy saved)")
     else echo "  ${Y}plugin $slug is a single file; repair it by hand${N}"; fi
   done
+  fi
   [ ${#plan[@]} -gt 0 ] || continue
   echo "  ${B}Plan:${N}"; printf '    - %s\n' "${plan[@]}"
   if [ "$YES" = 0 ]; then
@@ -210,12 +245,25 @@ for line in "${INST[@]}"; do
     [[ "$ans" =~ ^[yYjJ] ]] || { echo "  skipped"; continue; }
   fi
   mkdir -p "$Q"; chmod 700 "$QBASE" "$Q"
+  did=0; core_done=0
 
-  if [ $(( ${#C_MOD[@]} + ${#C_MISS[@]} )) -gt 0 ]; then
+  for slug in "${removable[@]}"; do
+    if [ -d "$pdir_base/$slug" ]; then
+      arc="$Q/plugins/$slug-inactive.tar.gz"; mkdir -p "$Q/plugins"
+      if tar -czpf "$arc" -C "$pdir_base" "$slug"; then
+        rm -rf "${pdir_base:?}/$slug" && record plugin "$pdir_base/$slug" "$arc" && did=1 && echo "    removed inactive plugin $slug"
+      else echo "    ${Y}could not archive $slug, left in place${N}"; fi
+    else
+      quarantine "$pdir_base/$slug.php" && did=1
+    fi
+  done
+
+  if [ "$FIX" = 1 ] && [ $(( ${#C_MOD[@]} + ${#C_MISS[@]} )) -gt 0 ]; then
     for f in "${C_MOD[@]}"; do save_copy "$root/$f"; done
-    wpt "$id" core download --version="$ver" --skip-content --force | sed 's/^/    /'
+    out=$(wpt "$id" core download --version="$ver" --skip-content --force); printf '%s\n' "$out" | sed 's/^/    /'
+    grep -q '^Success' <<< "$out" && { did=1; core_done=1; }
   fi
-  for f in "${C_EXTRA[@]}"; do quarantine "$root/$f"; done
+  if [ "$FIX" = 1 ]; then for f in "${C_EXTRA[@]}"; do quarantine "$root/$f" && { did=1; core_done=1; }; done; fi
 
   for slug in "${fixable[@]}"; do
     pdir="$root/wp-content/plugins/$slug"
@@ -223,20 +271,27 @@ for line in "${INST[@]}"; do
     [ -n "$pver" ] || { echo "    ${Y}could not read the version of $slug, skipped${N}"; continue; }
     arc="$Q/plugins/$slug-$pver.tar.gz"; mkdir -p "$Q/plugins"
     tar -czpf "$arc" -C "$root/wp-content/plugins" "$slug" && record plugin "$pdir" "$arc"
-    wpt "$id" plugin install "$slug" --version="$pver" --force | sed 's/^/    /'
+    out=$(wpt "$id" plugin install "$slug" --version="$pver" --force); printf '%s\n' "$out" | sed 's/^/    /'
+    if ! grep -q '^Success' <<< "$out"; then
+      echo "    ${Y}$slug was not reinstalled; the plugin is unchanged${N}"
+      sed -i "\#	$arc\$#d" "$Q/manifest.tsv"; rm -f "$arc"; continue
+    fi
+    did=1
     # Files that are still not part of the official plugin go to quarantine.
     wpt "$id" plugin verify-checksums "$slug" --format=csv | sed 's/"//g' | awk -F, '$3 == "File was added" {print $2}' \
       | while IFS= read -r f; do quarantine "$pdir/$f"; done
   done
 
-  after=$(wpt "$id" core verify-checksums | grep -cE "^Warning: File (doesn't verify|should not exist)")
-  if [ "$after" -eq 0 ]; then echo "  ${G}core now verifies against checksums${N}"; else echo "  ${Y}core still has $after finding(s)${N}"; fi
-  FIXED=$((FIXED + 1))
+  if [ "$core_done" = 1 ]; then
+    after=$(wpt "$id" core verify-checksums | grep -cE "^Warning: File (doesn't verify|should not exist)")
+    if [ "$after" -eq 0 ]; then echo "  ${G}core now verifies against checksums${N}"; else echo "  ${Y}core still has $after finding(s)${N}"; fi
+  fi
+  [ "$did" = 1 ] && FIXED=$((FIXED + 1))
 done
 
 echo
-echo "${B}Summary:${N} $TOTAL installation(s) checked, $DIRTY with findings ($FINDINGS item(s)), $STALE not found on disk$([ "$FIX" = 1 ] && echo ", $FIXED repaired")."
-if [ "$FIX" = 1 ] && [ -d "$Q" ]; then
+echo "${B}Summary:${N} $TOTAL installation(s) checked, $DIRTY with findings ($FINDINGS item(s)), $STALE not found on disk$([ "$ACT" = 1 ] && echo ", $FIXED changed")."
+if [ "$ACT" = 1 ] && [ -s "$Q/manifest.tsv" ]; then
   echo "Everything replaced or moved is saved in $Q"
   echo "Undo with: plesk-wp-integrity --restore $Q"
 elif [ "$DIRTY" -gt 0 ]; then

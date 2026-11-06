@@ -15,6 +15,8 @@ By default it only checks. Nothing changes until you add `--fix`, and even then 
 | **Core files** | Modified files in WordPress core, files that should not be there (in `wp-admin`, `wp-includes` and the root), and missing files |
 | **Plugins** | Modified, added and missing files in plugins from the wordpress.org directory |
 | **Suspicious code** | Modified or extra PHP files are searched for typical backdoor code (`eval(base64_decode(...))`, request data run as code or commands, etc.) and marked `SUSPICIOUS CODE` |
+| **Closed plugins** | Plugins with findings that have been closed on wordpress.org (often for security reasons) and get no more updates |
+| **Inactive plugins** | Plugins that are installed but not active. They never run in WordPress, but their files can still be reached and exploited directly |
 | **Stale entries** | WP Toolkit installations whose folder no longer exists |
 
 The output is cleaned up: WP Toolkit's own error log lines, the PHP deprecation warnings from its bundled wp-cli and duplicate lines are removed, and only installations with findings are listed.
@@ -51,6 +53,7 @@ Example:
 | Extra core files | Moved to quarantine |
 | wordpress.org plugin with modified files | Plugin reinstalled from wordpress.org, same version. The old plugin folder is archived first. |
 | Files a plugin should not have | Moved to quarantine after the reinstall |
+| Plugin closed on wordpress.org | Not reinstalled (it can't be). Remove or replace it, e.g. with `--remove-inactive` if it's inactive |
 
 Never touched: plugins that are not on wordpress.org, single-file plugins, themes, `wp-content/uploads` and `wp-config.php`.
 
@@ -61,6 +64,17 @@ plesk-wp-integrity --restore /var/backups/plesk-wp-integrity/<time>
 ```
 
 Repair one site at a time with `-d`, and check the site afterwards.
+
+## Removing inactive plugins (`--remove-inactive`)
+
+Inactive plugins are a common way in: they are rarely updated, but their PHP files are still on the server and can be called directly. `--remove-inactive` removes them:
+
+- each plugin folder is archived to the quarantine folder first, then removed from the site
+- single-file plugins (like `hello.php`) are moved to quarantine
+- settings in the database are not touched, so a restored plugin works as before
+- a plugin that is both inactive and modified is removed instead of reinstalled
+
+It can be combined with `--fix`. Like `--fix`, it shows the plan and asks per site, and `--restore` puts everything back.
 
 ## Requirements
 
@@ -85,6 +99,8 @@ plesk-wp-integrity -i 122                # only WP Toolkit instance 122
 plesk-wp-integrity --core-only           # skip plugins (faster)
 plesk-wp-integrity --fix -d example.com  # repair one site, asks first
 plesk-wp-integrity --fix --yes           # repair everything without asking
+plesk-wp-integrity --remove-inactive -d example.com   # remove inactive plugins, asks first
+plesk-wp-integrity --fix --remove-inactive -d example.com
 plesk-wp-integrity --restore DIR         # undo a repair
 ```
 
