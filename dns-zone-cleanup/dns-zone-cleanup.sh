@@ -72,6 +72,7 @@
 #   dns-zone-cleanup status      Settings, next run and last runs
 #   dns-zone-cleanup uninstall   Remove schedule, settings and script
 #   dns-zone-cleanup version
+#   dns-zone-cleanup help        The full manual (also: man dns-zone-cleanup after install)
 #
 #   One-line install: wget -qO- <raw URL> | sudo bash -s install
 #
@@ -113,7 +114,7 @@ log_event() {
 # Installation, updates and scheduling
 # ---------------------------------------------------------------------------
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 REPO_RAW="${PSZC_REPO_RAW:-https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts}"   # override only for testing
 REPO_API="${PSZC_REPO_API:-https://api.github.com/repos/weconnect-tobias/Plesk-Scripts}"
 TAG_PREFIX="dns-zone-cleanup-v"   # releases of this script are tagged dns-zone-cleanup-v1.2.3
@@ -667,6 +668,7 @@ cmd_install() {
         rm -f "$src"
     fi
     info "Installed $SCRIPT_PATH"
+    if install_man; then info "Installed the manual page: man $MARKER (or: $MARKER help)"; fi
     if [ -n "$LEGACY_FOUND" ]; then
         ln -sfn "$SCRIPT_PATH" "/usr/local/sbin/$LEGACY"
         info "The old command $LEGACY now runs $MARKER (old backups stay in /var/backups/$LEGACY)"
@@ -940,6 +942,7 @@ cmd_uninstall() {
     remove_schedules
     rm -f "$CONF_FILE" "$SCRIPT_PATH"
     [ -L "/usr/local/sbin/$LEGACY" ] && rm -f "/usr/local/sbin/$LEGACY"
+    rm -f "$MAN_FILE"; command -v mandb >/dev/null 2>&1 && mandb -q >/dev/null 2>&1
     rm -rf "$STATE_DIR"     # the event log in /var/log is kept
     logger -t "$TAG" -- "uninstalled" 2>/dev/null || true
     info "Removed schedule, $CONF_FILE and $SCRIPT_PATH. BIND and its zones are untouched."
@@ -981,7 +984,375 @@ cmd_status() {
     exit 0
 }
 
+
+# ---------------------------------------------------------------------------
+# Manual page (installed to /usr/local/share/man/man8 by "install", shown by "help")
+# ---------------------------------------------------------------------------
+
+MAN_FILE="/usr/local/share/man/man8/dns-zone-cleanup.8"
+
+man_page() {
+cat <<'MANEOF'
+.TH DNS-ZONE-CLEANUP 8 "2026-11-11" "dns-zone-cleanup VERSION_PLACEHOLDER" "System Administration"
+.SH NAME
+dns-zone-cleanup \- remove stale secondary zones from BIND nameservers
+.SH SYNOPSIS
+.B dns-zone-cleanup
+.RI [ delete | keep | archive ]
+.RB [ dryrun ]
+.RB [ verbose ]
+.br
+.B dns-zone-cleanup
+.I IP-ADDRESS
+.RI [ delete | keep | archive ]
+.RB [ dryrun ]
+.br
+.B dns-zone-cleanup
+.I ZONE
+.RI [ ZONE ...]
+.RI [ delete | keep | archive ]
+.RB [ dryrun ]
+.RB [ force ]
+.br
+.B dns-zone-cleanup delegation
+.RI [ ZONE ...]
+.RB [ verbose ]
+.br
+.B dns-zone-cleanup
+.BR install " [" \fIOPTIONS\fR "] | " update " | " check " | " status " | " report " | " uninstall " | " help " | " version
+.SH DESCRIPTION
+.B dns-zone-cleanup
+is installed once on every secondary nameserver and then runs by itself. It finds
+secondary (slave) zones that are no longer needed and removes them. It works with any
+primary (Plesk, cPanel, another BIND server), on new and old BIND versions, and with zones
+added by
+.B rndc addzone
+as well as zones written into
+.BR named.conf .
+.PP
+On a primary (master) server it changes nothing by default. It checks the zones the
+server is primary for and reports the ones whose domain has moved or expired.
+.PP
+Run it as a regular user with sudo. It uses sudo where it needs to. Running as root also works.
+.SH WHAT IS STALE
+.TP
+.B RETRY
+The primary no longer answers for the zone. Found in named's log:
+"refresh: retry limit for primary ... exceeded".
+.TP
+.B DISABLED
+The primary answers but no longer has the zone, for example after DNS was switched off for
+the domain. Found in the log: "unexpected rcode (REFUSED)", "(NOTAUTH)",
+"non-authoritative answer".
+.TP
+.B MOVED
+The domain's NS records at the TLD point to other nameservers only. Checked once a day.
+The zone is removed after it has been like that for 7 days in a row.
+.TP
+.B UNREG
+The domain no longer exists at the TLD (NXDOMAIN). Same 7-day rule.
+.PP
+RETRY and DISABLED zones are checked live against every primary in the zone's current
+config before anything is removed. A zone that any primary still serves is kept.
+Zones this server is primary for are never touched by these checks.
+.SH HOW A ZONE IS REMOVED
+.TP
+.B Added with rndc addzone
+.B rndc delzone
+(for example zones from Plesk Slave DNS Manager).
+.TP
+.B Defined in named.conf or an included file
+The zone statement is commented out with "# ". The file is backed up first,
+.B named-checkconf
+must pass (otherwise every change is rolled back), then BIND is reloaded.
+.TP
+.B Cannot be done safely
+Reported as "remove by hand", in the output and in the mail report.
+.PP
+The zone file is deleted, kept or archived, see
+.BR delete ", " keep ", " archive .
+.SH RUN OPTIONS
+.TP
+.BR delete " | " yes
+Delete the zone file and journal of a removed zone (default).
+.TP
+.BR keep " | " no
+Leave the zone file where it is.
+.TP
+.B archive
+Move the zone file to /var/backups/dns-zone-cleanup/\fITIME\fR/zones/.
+.TP
+.B dryrun
+Show what would be done and how, change nothing.
+.TP
+.B verbose
+Also list zones from the log that are already gone, and OK zones in
+.BR delegation .
+.TP
+.B force
+With zone names only: remove the zone even if a primary still serves it. Primary zones are
+never removed, not even with force.
+.TP
+.I IP-ADDRESS
+Only look at log entries for this primary.
+.TP
+.I ZONE
+Remove these zones (after the live check) instead of searching the log.
+.SH COMMANDS
+.TP
+.B delegation
+Show the delegation check for all secondary and primary zones, change nothing. Lists
+only zones that are not OK; add
+.B verbose
+for all.
+.TP
+.B install
+Install missing packages (dig, logger), copy the script to /usr/local/sbin, install this
+manual page and schedule the cleanup with a systemd timer (or cron). Run it again to
+change settings; settings you don't mention are kept. Takes over an existing
+plesk-slave-zone-cleanup installation (the old name of this script).
+.TP
+.B check
+Show the installed version and the version on GitHub. Exit status 10 when an update is
+available.
+.TP
+.BR update " [" --force "]"
+Install the version on GitHub if it is newer and the download is a valid copy of this
+script.
+.TP
+.B status
+Settings, next runs, last runs, zones waiting to be removed, latest events.
+.TP
+.BR report " [" --test | --print | --always "]"
+Mail what happened since the last report. --test sends a test mail, --print shows the
+report instead of sending it, --always sends even when nothing happened.
+.TP
+.B uninstall
+Remove the schedule, settings, script and this manual page. BIND and its zones are
+untouched.
+.TP
+.B help
+Show this manual page.
+.SH INSTALL OPTIONS
+.TP
+.BI --interval " TIME"
+How often to run: 5min to 24h, default 1h.
+.TP
+.BR --delete-files " | " --keep-files " | " --archive-files
+What to do with zone files of removed zones (default: delete).
+.TP
+.BR --conf-zones " comment | skip"
+Zones in named.conf: comment them out (default), or only report them.
+.TP
+.BR --delegation " on | report | off"
+Delegation check: remove MOVED/UNREG zones (default), only report them, or skip the check.
+Use report or off on hidden secondaries that are not in the NS records.
+.TP
+.BI --delegation-days " N"
+Days a zone must stay MOVED/UNREG before it is removed (default 7).
+.TP
+.BI --own-ips " \(dqIP IP\(dq"
+This server's addresses, if they can't be seen on the interfaces (NAT).
+.TP
+.BI --exclude " \(dqZONE PATTERN\(dq"
+Zones that are never touched, shell patterns allowed (*.example.se).
+.BR --no-exclude " clears the list."
+.TP
+.BR --primary-zones " report | comment"
+On a primary: only report stale primary zones (default), or also comment out unambiguous
+ones (UNREG, or MOVED to another primary) after --delegation-days. Their zone files are
+always archived. Nothing is removed on Plesk servers.
+.TP
+.BR --auto-update " | " --no-auto-update
+Update daily around 04:00.
+.TP
+.BI --ref " main | latest | vX.Y.Z"
+Where updates come from: the main branch (default, follows VERSION in the script), the
+newest GitHub release of this script, or one fixed release.
+.SH MAIL REPORT
+.TP
+.BI --report-email " ADDRESS[,ADDRESS]"
+Send a daily report when something happened. --no-report turns it off.
+.TP
+.BI --report-time " HH:MM"
+When to send it (default 07:00, server time).
+.TP
+.BR --report-always " | " --report-changes
+Mail every day, or only when something happened (default).
+.TP
+.BI --smtp " URL"
+smtps://host:465, smtp://host:587 or smtp://host:25. Without --smtp the local sendmail is used.
+.BR --no-smtp " goes back to sendmail."
+.TP
+.BI --smtp-user " USER"
+Log in. The password is asked for (or taken from SMTP_PASSWORD) and stored in
+/etc/dns-zone-cleanup.conf, readable by root only.
+.TP
+.B --no-smtp-auth
+Don't log in: a relay that allows this server by IP address.
+.TP
+.BR --smtp-tls " require | try | off"
+Encryption: required (default), STARTTLS if offered, or none. A password is never sent
+without encryption.
+.TP
+.BI --mail-from " ADDRESS"
+Sender. Default: the SMTP login, otherwise dns-zone-cleanup@\fIHOST\fR.
+.SH SAFETY
+.IP \(bu 2
+If 10 or more zones of one primary would be removed only because it times out, they are
+held back: the primary may simply be down. Interactively you are asked first.
+.IP \(bu 2
+If more than half of the zones look "not delegated here", the script assumes its own
+addresses are wrong and removes nothing (see --own-ips).
+.IP \(bu 2
+Only registered domains are checked by the delegation check, not sub-zones, *.arpa or
+private names like .local.
+.IP \(bu 2
+Config files are backed up before they are changed and restored if named-checkconf fails.
+.IP \(bu 2
+Only one run at a time. Without a terminal (cron, ssh) nothing is ever asked.
+.SH FILES
+.TP
+.I /usr/local/sbin/dns-zone-cleanup
+The script.
+.TP
+.I /etc/dns-zone-cleanup.conf
+Settings, written by install (root only).
+.TP
+.I /var/log/dns-zone-cleanup.log
+Every removal, failure and report event. Also in syslog with the tag dns-zone-cleanup.
+.TP
+.I /var/lib/dns-zone-cleanup/
+State: delegation check results, last report.
+.TP
+.I /var/backups/dns-zone-cleanup/TIME/
+Backups of changed config files (config/) and archived zone files (zones/).
+.SH ENVIRONMENT
+.TP
+.B LOGFILE
+Read this log instead of /var/log/syslog, /var/log/messages or the journal.
+.TP
+.B NAMED_CONF
+Use this named.conf (found automatically, also in a chroot).
+.TP
+.B SMTP_PASSWORD
+SMTP password for a scripted install.
+.SH EXIT STATUS
+.TP
+.B 0
+OK, or nothing to do.
+.TP
+.B 1
+Error, or a removal failed.
+.TP
+.B 2
+Zones held back by a safety check.
+.SH EXAMPLES
+.TP
+Install with a daily mail report:
+.nf
+wget -qO- https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/dns-zone-cleanup/dns-zone-cleanup.sh \\
+  | sudo bash -s install --report-email ops@example.com \\
+    --smtp smtps://smtp.example.com:465 --smtp-user noreply@example.com
+.fi
+.TP
+See what the next run would do:
+.B dns-zone-cleanup dryrun
+.TP
+Remove one zone on every secondary:
+.nf
+for ns in ns1 ns2 ns3; do ssh $ns dns-zone-cleanup example.se delete; done
+.fi
+.TP
+Relay without login:
+.nf
+sudo dns-zone-cleanup install --report-email ops@example.com \\
+  --smtp smtp://relay.example.com:25 --no-smtp-auth --smtp-tls try --mail-from dns@example.com
+.fi
+.SH SEE ALSO
+.BR named (8),
+.BR rndc (8),
+.BR named-checkconf (8),
+.BR dig (1)
+.PP
+https://github.com/weconnect-tobias/Plesk-Scripts/tree/main/dns-zone-cleanup
+.SH LICENSE
+MIT.
+MANEOF
+}
+
+# The page with the right version in it
+man_text() { man_page | sed "s/VERSION_PLACEHOLDER/$VERSION/"; }
+
+# Is "man" usable? (minimized Ubuntu replaces it with a stub that only prints a notice)
+man_works() {
+    command -v man >/dev/null 2>&1 || return 1
+    ! grep -qs "minimized" "$(command -v man)"
+}
+
+# Turn the troff page into plain text, for systems without a working man:
+# text is collected into paragraphs and wrapped, .nf/.fi blocks are kept as they are.
+man_plain() {
+    man_text | awk -v W="${COLUMNS:-80}" '
+        function clean(s) { gsub(/\\f[BIRP]/, "", s); gsub(/\\-/, "-", s); gsub(/\\\(bu/, "*", s)
+                            gsub(/\\\(dq/, "\"", s); gsub(/\\\\/, "\\", s); return s }
+        # Arguments of a font macro; alternating macros (.BR etc.) join them without spaces
+        function args(line, alt,   out, n, a, i, rest, q) {
+            out = ""; rest = line
+            while (length(rest) > 0) {
+                sub(/^ +/, "", rest); if (rest == "") break
+                if (substr(rest, 1, 1) == "\"") { q = index(substr(rest, 2), "\""); a = substr(rest, 2, q - 1); rest = substr(rest, q + 2) }
+                else { n = index(rest, " "); if (n == 0) { a = rest; rest = "" } else { a = substr(rest, 1, n - 1); rest = substr(rest, n + 1) } }
+                out = out (alt || out == "" ? "" : " ") a
+            }
+            return out
+        }
+        function add(t) { t = clean(t); if (t == "") return; buf = (buf == "" ? t : buf " " t) }
+        function flush(   n, w, i, line, pre) {
+            if (buf == "") return
+            n = split(buf, w, " "); line = ""; pre = sprintf("%" ind "s", "")
+            for (i = 1; i <= n; i++) {
+                if (length(pre line " " w[i]) > W && line != "") { print pre line; line = w[i] }
+                else line = (line == "" ? w[i] : line " " w[i])
+            }
+            if (line != "") print pre line
+            buf = ""
+        }
+        BEGIN { ind = 7 }
+        /^\.TH/ { next }
+        /^\.SH/ { flush(); sub(/^\.SH +/, ""); gsub(/"/, ""); print ""; print $0; ind = 7; next }
+        /^\.(PP|LP|P)( |$)/ { flush(); print ""; ind = 7; next }
+        /^\.br/ { flush(); next }
+        /^\.TP/ { flush(); print ""; tag = 1; next }
+        /^\.IP/ { flush(); print ""; ind = 7; buf = "*"; ind2 = 9; next }
+        /^\.nf/ { flush(); nf = 1; next }
+        /^\.fi/ { nf = 0; next }
+        nf { print sprintf("%" (ind + 2) "s", "") clean($0); next }
+        /^\.(BR|RB|IR|RI|BI|IB) / { m = substr($0, 2, 2); t = args(substr($0, 5), 1) }
+        /^\.(B|I) / { t = args(substr($0, 4), 0) }
+        /^\.[A-Z]/ { add(t); t = ""; if (tag) { ind = 2; flush(); ind = 11; tag = 0 } next }
+        { add($0); if (tag) { ind = 2; flush(); ind = 11; tag = 0 } }
+        END { flush() }
+    ' | cat -s
+}
+
+cmd_help() {
+    if man_works; then
+        man -l <(man_text) 2>/dev/null && return
+    fi
+    if [ -t 1 ] && command -v less >/dev/null 2>&1; then man_plain | less -R; else man_plain; fi
+}
+
+install_man() {
+    mkdir -p "$(dirname "$MAN_FILE")" || return 1
+    man_text > "$MAN_FILE.tmp" && chmod 644 "$MAN_FILE.tmp" && mv -f "$MAN_FILE.tmp" "$MAN_FILE" || return 1
+    command -v mandb >/dev/null 2>&1 && mandb -q "$(dirname "$(dirname "$MAN_FILE")")" >/dev/null 2>&1
+    command -v makewhatis >/dev/null 2>&1 && makewhatis "$(dirname "$(dirname "$MAN_FILE")")" >/dev/null 2>&1
+    return 0
+}
+
 case "${1:-}" in
+    help|--help|-h|man) cmd_help; exit 0 ;;
     install)   need_root "$@"; shift; cmd_install "$@" ;;
     update)    need_root "$@"; shift; cmd_update "$@" ;;
     check)     shift; cmd_update --check "$@" ;;
@@ -1009,6 +1380,8 @@ usage() {
     echo "       $(basename "$0") report [--test|--print|--always]"
     echo "       $(basename "$0") check | update [--force] | status | uninstall | version"
     echo "       (yes = delete, no = keep)"
+    echo
+    echo "Everything explained: $(basename "$0") help   (or: man $MARKER)"
     exit 1
 }
 

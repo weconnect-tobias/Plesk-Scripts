@@ -13,6 +13,18 @@ dns-zone-cleanup dryrun
 
 *This script used to be called `plesk-slave-zone-cleanup`. Existing installations move over by themselves, see [Moving from plesk-slave-zone-cleanup](#moving-from-plesk-slave-zone-cleanup).*
 
+## Help on the server
+
+Everything in this README is also on the server, no browser needed:
+
+```bash
+man dns-zone-cleanup        # after install
+dns-zone-cleanup help       # always works, also where man is missing or the system is minimized
+dns-zone-cleanup            # short usage: run with an unknown option, e.g. dns-zone-cleanup -x
+```
+
+The manual page is part of the script itself. `install` writes it to `/usr/local/share/man/man8/` and every `update` refreshes it, so it always matches the installed version.
+
 ## What it finds
 
 A secondary zone is stale when:
