@@ -78,8 +78,8 @@ It does run a daily, **report-only** check of the primary zones. That catches th
 
 | Status | Meaning |
 |---|---|
-| `OURS` | The TLD delegates to the zone's own nameservers, or to other names with the same addresses |
-| `MOVED` | The TLD delegates to other nameservers only. This server serves a stale copy. |
+| `OURS` | The TLD delegates to the zone's own nameservers, to other names with the same addresses, or to nameservers that serve the same SOA serial as this server (they get the zone from here) |
+| `MOVED` | The TLD delegates to other nameservers, and they serve a different version of the zone. This server has a stale copy. |
 | `UNREG` | The domain no longer exists at the TLD |
 
 Each stale zone is reported twice in the mail report: the day it is found, and again after `--delegation-days` days if it stays like that. The report includes the command to switch it off; on Plesk that is `plesk bin dns --off example.se`. `dns-zone-cleanup delegation` shows the table for all primary zones.

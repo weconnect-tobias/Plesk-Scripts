@@ -110,7 +110,7 @@ log_event() {
 # Installation, updates and scheduling
 # ---------------------------------------------------------------------------
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 REPO_RAW="${PSZC_REPO_RAW:-https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts}"   # override only for testing
 REPO_API="${PSZC_REPO_API:-https://api.github.com/repos/weconnect-tobias/Plesk-Scripts}"
 TAG_PREFIX="dns-zone-cleanup-v"   # releases of this script are tagged dns-zone-cleanup-v1.2.3
@@ -1517,7 +1517,27 @@ primary_status() {
     if [ -n "$tld_ips" ] && [ -n "$own_ips" ] && [ -n "$(comm -12 <(echo "$tld_ips") <(echo "$own_ips"))" ]; then
         PSTATUS="OURS"; return
     fi
+    # The delegated nameservers may still get the zone from here (the NS records inside the
+    # zone are just different). Then they serve the same SOA serial as this server.
+    local my_serial their_serial
+    my_serial="$(zone_serial "$z" 127.0.0.1)"
+    [ -z "$my_serial" ] && for n in "${!OWN[@]}"; do my_serial="$(zone_serial "$z" "$n")"; [ -n "$my_serial" ] && break; done
+    if [ -n "$my_serial" ]; then
+        for n in $DNS_LIST; do
+            their_serial="$(zone_serial "$z" "$n")"
+            if [ "$their_serial" == "$my_serial" ]; then PSTATUS="OURS"; return; fi
+            [ -n "$their_serial" ] && break      # one authoritative answer with another serial is enough
+        done
+    fi
     PSTATUS="MOVED"
+}
+
+# SOA serial of zone $1 as served (authoritatively) by server $2
+zone_serial() {
+    local out
+    out="$(dig +norec +time=3 +tries=1 +noall +comments +answer SOA "$1." @"$2" 2>/dev/null)"
+    grep -qE 'flags:[^;]* aa' <<<"$out" || return
+    awk -v z="$1." 'tolower($1) == tolower(z) && $4 == "SOA" { print $7; exit }' <<<"$out"
 }
 
 off_hint() {
