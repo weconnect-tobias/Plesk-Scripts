@@ -36,6 +36,14 @@
 #       Installs missing packages (dig, logger) on Debian/Ubuntu, RHEL/Fedora, SUSE,
 #       Arch and Alpine, copies the script to /usr/local/sbin and schedules it with a
 #       systemd timer (or cron). Run again to change settings.
+#       Mail report: [--report-email a@example.com[,b@example.com]] [--report-time 07:00]
+#                    [--report-always|--report-changes] [--no-report] [--mail-from addr]
+#                    [--smtp smtps://smtp.example.com:465 --smtp-user user] [--no-smtp]
+#       Without --smtp the local sendmail is used. The SMTP password is asked for (or taken
+#       from SMTP_PASSWORD=...) and stored in /etc/plesk-slave-zone-cleanup.conf (root only).
+#   plesk-slave-zone-cleanup report      Mail what happened since the last report (nothing
+#                                        happened = no mail, unless --always / --report-always)
+#       --test   send a test mail     --print   show the report instead of sending it
 #   plesk-slave-zone-cleanup update      Update from GitHub (only if the download is valid)
 #   plesk-slave-zone-cleanup status      Settings, next run and last runs
 #   plesk-slave-zone-cleanup uninstall   Remove schedule, settings and script
@@ -68,7 +76,16 @@ as_root() {
 interactive() { [ -t 0 ] && [ -t 1 ]; }
 
 TAG="plesk-slave-zone-cleanup"
-log_sys() { logger -t "$TAG" -- "$*" 2>/dev/null || true; }
+EVENT_LOG="/var/log/plesk-slave-zone-cleanup.log"   # events for the daily mail report
+
+# Log an event to syslog/journal and to our own event log.
+# Types: REMOVED FAILED HELD UPDATED INSTALLED ERROR
+log_event() {
+    local type="$1"; shift
+    logger -t "$TAG" -- "$type: $*" 2>/dev/null || true
+    printf '%s %s %s %s\n' "$(date +%s)" "$(date '+%F %T')" "$type" "$*" \
+        | as_root tee -a "$EVENT_LOG" >/dev/null 2>&1 || true
+}
 
 # ---------------------------------------------------------------------------
 # Installation, updates and scheduling
@@ -154,21 +171,31 @@ put_script() {
     return 0
 }
 
+CONF_KEYS="REF INTERVAL FILES AUTO_UPDATE REPORT_EMAIL REPORT_TIME REPORT_ALWAYS MAIL_FROM SMTP_URL SMTP_USER SMTP_PASS"
 load_conf() {
     REF="main"; INTERVAL="1h"; FILES="yes"; AUTO_UPDATE="no"
-    # shellcheck disable=SC1090
-    [ -f "$CONF_FILE" ] && . "$CONF_FILE"
+    REPORT_EMAIL=""; REPORT_TIME="07:00"; REPORT_ALWAYS="no"
+    MAIL_FROM=""; SMTP_URL=""; SMTP_USER=""; SMTP_PASS=""
+    # The file holds the SMTP password and is only readable by root
+    if [ -f "$CONF_FILE" ]; then
+        if [ -r "$CONF_FILE" ]; then
+            # shellcheck disable=SC1090
+            . "$CONF_FILE"
+        else
+            # shellcheck disable=SC1090
+            . <(as_root cat "$CONF_FILE")
+        fi
+    fi
 }
 save_conf() {
-    cat > "$CONF_FILE" <<CONF
-# plesk-slave-zone-cleanup settings - written by '$MARKER install'.
-# Change them by running install again, e.g.: $MARKER install --interval 30min
-REF="$REF"
-INTERVAL="$INTERVAL"
-FILES="$FILES"
-AUTO_UPDATE="$AUTO_UPDATE"
-CONF
-    chmod 644 "$CONF_FILE"
+    local k
+    umask 077
+    {
+        echo "# plesk-slave-zone-cleanup settings - written by '$MARKER install'."
+        echo "# Change them by running install again, e.g.: $MARKER install --interval 30min"
+        for k in $CONF_KEYS; do printf '%s=%q\n' "$k" "${!k}"; done
+    } > "$CONF_FILE"
+    chmod 600 "$CONF_FILE"
 }
 
 # "1h", "30min", "15m" -> minutes (for cron)
@@ -189,9 +216,10 @@ cron_spec() {
 
 remove_schedules() {
     if has_systemd; then
-        systemctl disable --now "$MARKER.timer" "$MARKER-update.timer" >/dev/null 2>&1
+        systemctl disable --now "$MARKER.timer" "$MARKER-update.timer" "$MARKER-report.timer" >/dev/null 2>&1
         rm -f "$UNIT_DIR/$MARKER.service" "$UNIT_DIR/$MARKER.timer" \
-              "$UNIT_DIR/$MARKER-update.service" "$UNIT_DIR/$MARKER-update.timer"
+              "$UNIT_DIR/$MARKER-update.service" "$UNIT_DIR/$MARKER-update.timer" \
+              "$UNIT_DIR/$MARKER-report.service" "$UNIT_DIR/$MARKER-report.timer"
         systemctl daemon-reload
     fi
     rm -f "$CRON_FILE"
@@ -204,6 +232,8 @@ remove_schedules() {
 write_schedules() {
     local run_cmd="$SCRIPT_PATH $FILES"
     local upd_cmd="$SCRIPT_PATH update --quiet"
+    local rep_cmd="$SCRIPT_PATH report"
+    local rep_h="${REPORT_TIME%%:*}" rep_m="${REPORT_TIME##*:}"
     if has_systemd; then
         cat > "$UNIT_DIR/$MARKER.service" <<UNIT
 [Unit]
@@ -255,11 +285,37 @@ Persistent=true
 WantedBy=timers.target
 UNIT
         fi
+        if [ -n "$REPORT_EMAIL" ]; then
+            cat > "$UNIT_DIR/$MARKER-report.service" <<UNIT
+[Unit]
+Description=Daily mail report from $MARKER
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$rep_cmd
+UNIT
+            cat > "$UNIT_DIR/$MARKER-report.timer" <<UNIT
+[Unit]
+Description=Daily mail report from $MARKER
+
+[Timer]
+OnCalendar=*-*-* $REPORT_TIME:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+        fi
         command -v restorecon >/dev/null 2>&1 && restorecon "$UNIT_DIR"/"$MARKER"* 2>/dev/null
         systemctl daemon-reload
         systemctl enable --now "$MARKER.timer" >/dev/null || die "could not enable $MARKER.timer"
         if [ "$AUTO_UPDATE" == "yes" ]; then
             systemctl enable --now "$MARKER-update.timer" >/dev/null || die "could not enable $MARKER-update.timer"
+        fi
+        if [ -n "$REPORT_EMAIL" ]; then
+            systemctl enable --now "$MARKER-report.timer" >/dev/null || die "could not enable $MARKER-report.timer"
         fi
         info "Scheduled with systemd timer(s)"
     elif [ -d /etc/cron.d ] && ! command -v apk >/dev/null 2>&1; then
@@ -269,6 +325,7 @@ UNIT
             echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             echo "$(cron_spec "$INTERVAL") root $run_cmd >/dev/null 2>&1"
             [ "$AUTO_UPDATE" == "yes" ] && echo "$(( RANDOM % 60 )) 4 * * * root $upd_cmd >/dev/null 2>&1"
+            [ -n "$REPORT_EMAIL" ] && echo "$((10#$rep_m)) $((10#$rep_h)) * * * root $rep_cmd >/dev/null 2>&1"
         } > "$CRON_FILE"
         chmod 644 "$CRON_FILE"
         info "Scheduled with cron ($CRON_FILE)"
@@ -277,6 +334,7 @@ UNIT
             echo "# BEGIN $MARKER"
             echo "$(cron_spec "$INTERVAL") $run_cmd >/dev/null 2>&1"
             [ "$AUTO_UPDATE" == "yes" ] && echo "$(( RANDOM % 60 )) 4 * * * $upd_cmd >/dev/null 2>&1"
+            [ -n "$REPORT_EMAIL" ] && echo "$((10#$rep_m)) $((10#$rep_h)) * * * $rep_cmd >/dev/null 2>&1"
             echo "# END $MARKER"
         } >> /etc/crontabs/root
         info "Scheduled in /etc/crontabs/root (BusyBox crond)"
@@ -300,6 +358,7 @@ log_source() {
 
 cmd_install() {
     local new_ref="" new_interval="" new_files="" new_auto="" src=""
+    local opt_email="" opt_rtime="" opt_ralways="" opt_from="" opt_smtp="" opt_suser=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --interval)       new_interval="${2:-}"; shift ;;
@@ -310,6 +369,20 @@ cmd_install() {
             --delete-files)   new_files="yes" ;;
             --auto-update)    new_auto="yes" ;;
             --no-auto-update) new_auto="no" ;;
+            --report-email)   opt_email="${2:-}"; shift ;;
+            --report-email=*) opt_email="${1#*=}" ;;
+            --report-time)    opt_rtime="${2:-}"; shift ;;
+            --report-time=*)  opt_rtime="${1#*=}" ;;
+            --report-always)  opt_ralways="yes" ;;
+            --report-changes) opt_ralways="no" ;;
+            --no-report)      opt_email="-" ;;
+            --mail-from)      opt_from="${2:-}"; shift ;;
+            --mail-from=*)    opt_from="${1#*=}" ;;
+            --smtp)           opt_smtp="${2:-}"; shift ;;
+            --smtp=*)         opt_smtp="${1#*=}" ;;
+            --smtp-user)      opt_suser="${2:-}"; shift ;;
+            --smtp-user=*)    opt_suser="${1#*=}" ;;
+            --no-smtp)        opt_smtp="-" ;;
             *) die "unknown install option: $1" ;;
         esac
         shift
@@ -317,6 +390,53 @@ cmd_install() {
     load_conf     # keep earlier settings unless overridden
     REF="${new_ref:-$REF}"; INTERVAL="${new_interval:-$INTERVAL}"
     FILES="${new_files:-$FILES}"; AUTO_UPDATE="${new_auto:-$AUTO_UPDATE}"
+    [ -n "$opt_email" ]   && REPORT_EMAIL="$opt_email"
+    [ "$REPORT_EMAIL" == "-" ] && REPORT_EMAIL=""
+    [ -n "$opt_rtime" ]   && REPORT_TIME="$opt_rtime"
+    [ -n "$opt_ralways" ] && REPORT_ALWAYS="$opt_ralways"
+    [ -n "$opt_from" ]    && MAIL_FROM="$opt_from"
+    if [ "$opt_smtp" == "-" ]; then SMTP_URL=""; SMTP_USER=""; SMTP_PASS=""
+    elif [ -n "$opt_smtp" ]; then SMTP_URL="$opt_smtp"
+    fi
+    if [ -n "$opt_suser" ]; then
+        [ "$opt_suser" != "$SMTP_USER" ] && SMTP_PASS=""
+        SMTP_USER="$opt_suser"
+    fi
+
+    # Mail settings
+    local email_re='^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' e
+    if [ -n "$REPORT_EMAIL" ]; then
+        for e in ${REPORT_EMAIL//,/ }; do
+            [[ "$e" =~ $email_re ]] || die "invalid --report-email address '$e'"
+        done
+        [[ "$REPORT_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "invalid --report-time '$REPORT_TIME' (use HH:MM)"
+        if [ -z "$MAIL_FROM" ]; then
+            # Most SMTP servers want From = the login; otherwise use the host's FQDN,
+            # or the report address's domain when the host has no domain name
+            local fqdn first="${REPORT_EMAIL%%,*}"
+            fqdn="$(hostname -f 2>/dev/null || hostname)"
+            if [[ "$SMTP_USER" =~ $email_re ]]; then MAIL_FROM="$SMTP_USER"
+            elif [[ "$fqdn" == *.* ]]; then MAIL_FROM="$MARKER@$fqdn"
+            else MAIL_FROM="$MARKER@${first#*@}"
+            fi
+        fi
+        [[ "$MAIL_FROM" =~ $email_re ]] || die "invalid --mail-from address '$MAIL_FROM'"
+        if [ -n "$SMTP_URL" ]; then
+            [[ "$SMTP_URL" =~ ^smtps?://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]] \
+                || die "invalid --smtp '$SMTP_URL' (use smtps://host:465 or smtp://host:587)"
+            if [ -n "$SMTP_USER" ] && [ -z "$SMTP_PASS" ]; then
+                if [ -n "${SMTP_PASSWORD:-}" ]; then
+                    SMTP_PASS="$SMTP_PASSWORD"
+                elif interactive; then
+                    read -r -s -p "SMTP password for $SMTP_USER: " SMTP_PASS; echo
+                else
+                    die "SMTP password needed: run interactively or set SMTP_PASSWORD=..."
+                fi
+            fi
+        elif ! command -v sendmail >/dev/null 2>&1 && [ ! -x /usr/sbin/sendmail ]; then
+            die "no local mail server (sendmail) found - give an SMTP server: --smtp smtps://smtp.example.com:465 --smtp-user user@example.com"
+        fi
+    fi
 
     [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || die "invalid --ref '$REF'"
     local mins; mins="$(interval_minutes "$INTERVAL")"
@@ -339,6 +459,9 @@ cmd_install() {
         apt-get) missing+=(bsdutils) ;; apk) missing+=(util-linux-misc) ;; *) missing+=(util-linux) ;; esac
     if [ "$AUTO_UPDATE" == "yes" ] && ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
         missing+=(wget)
+    fi
+    if [ -n "$REPORT_EMAIL" ] && [ -n "$SMTP_URL" ] && ! command -v curl >/dev/null 2>&1; then
+        missing+=(curl)    # curl speaks SMTP, so no mail server is needed
     fi
     if [ ${#missing[@]} -gt 0 ]; then
         [ -n "$pm" ] || die "missing ${missing[*]} and no known package manager found - install them by hand"
@@ -383,12 +506,16 @@ cmd_install() {
     save_conf
     remove_schedules
     write_schedules
-    log_sys "installed $VERSION (interval $INTERVAL, files $FILES, auto-update $AUTO_UPDATE, ref $REF)"
+    log_event INSTALLED "$VERSION (interval $INTERVAL, files $FILES, auto-update $AUTO_UPDATE, ref $REF, report ${REPORT_EMAIL:-off})"
 
     echo
     info "Done. Runs every $INTERVAL, zone files: $( [ "$FILES" == yes ] && echo deleted || echo kept ), auto-update: $AUTO_UPDATE$( [ "$AUTO_UPDATE" == yes ] && echo " (from '$REF')" )"
     echo "    See what the next run would do:  $MARKER dryrun"
     echo "    Status and last runs:            $MARKER status"
+    if [ -n "$REPORT_EMAIL" ]; then
+        echo "    Mail report to $REPORT_EMAIL daily at $REPORT_TIME ($( [ "$REPORT_ALWAYS" == yes ] && echo "every day" || echo "only when something happened" ))"
+        echo "    Send a test mail now:            sudo $MARKER report --test"
+    fi
     exit 0
 }
 
@@ -398,10 +525,10 @@ cmd_update() {
     load_conf
     new="$(mktemp)"
     if ! download "$REPO_RAW/$REF/$MARKER/$MARKER.sh" "$new"; then
-        rm -f "$new"; log_sys "update failed: download from $REF failed"; die "download failed"
+        rm -f "$new"; log_event ERROR "update failed: download from $REF failed"; die "download failed"
     fi
     if ! valid_script "$new"; then
-        rm -f "$new"; log_sys "update refused: downloaded file is not valid"; die "downloaded file is not a valid $MARKER script - keeping the current one"
+        rm -f "$new"; log_event ERROR "update refused: downloaded file from $REF is not valid"; die "downloaded file is not a valid $MARKER script - keeping the current one"
     fi
     if cmp -s "$new" "$SCRIPT_PATH"; then
         rm -f "$new"; [ -n "$quiet" ] || info "Already up to date ($VERSION)"; exit 0
@@ -409,17 +536,166 @@ cmd_update() {
     local newver; newver="$(sed -nE 's/^VERSION="([^"]+)".*/\1/p' "$new" | head -n1)"
     put_script "$new" || { rm -f "$new"; die "could not write $SCRIPT_PATH"; }
     rm -f "$new"
-    log_sys "updated $VERSION -> ${newver:-?} from $REF"
+    log_event UPDATED "$VERSION -> ${newver:-?} from $REF"
     info "Updated $VERSION -> ${newver:-?}"
     # Rewrite the schedule with the new version, in case the unit layout changed
     "$SCRIPT_PATH" install >/dev/null || warn "re-running install after update failed"
     exit 0
 }
 
+STATE_DIR="/var/lib/plesk-slave-zone-cleanup"
+
+# Send a mail: $1 = subject, body on stdin. Uses SMTP via curl if configured, else sendmail.
+send_mail() {
+    local subject="$1" msg rc e rcpts=()
+    msg="$(mktemp)"
+    {
+        echo "From: $MAIL_FROM"
+        echo "To: $REPORT_EMAIL"
+        echo "Subject: $subject"
+        echo "Date: $(LC_ALL=C date -R)"
+        echo "Message-ID: <$(date +%s).$$.$RANDOM@$(hostname -f 2>/dev/null || hostname)>"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: text/plain; charset=UTF-8"
+        echo "Content-Transfer-Encoding: 8bit"
+        echo "Auto-Submitted: auto-generated"
+        echo
+        cat
+    } > "$msg"
+    if [ -n "$SMTP_URL" ]; then
+        for e in ${REPORT_EMAIL//,/ }; do rcpts+=(--mail-rcpt "$e"); done
+        # Credentials go in through stdin so they never show up in ps.
+        # curl config strings: escape backslashes first, then double quotes.
+        local cred="$SMTP_USER:$SMTP_PASS"
+        cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"
+        {
+            [ -n "$SMTP_USER" ] && printf 'user = "%s"\n' "$cred"
+        } | curl -sS --ssl-reqd --crlf --connect-timeout 20 --max-time 60 -K - \
+                --url "$SMTP_URL" --mail-from "$MAIL_FROM" "${rcpts[@]}" -T "$msg"
+        rc=$?
+    else
+        local sm; sm="$(command -v sendmail || echo /usr/sbin/sendmail)"
+        "$sm" -oi -t < "$msg"
+        rc=$?
+    fi
+    rm -f "$msg"
+    return $rc
+}
+
+cmd_report() {
+    local mode="send" always="" host now last events n_rem n_fail n_held n_upd n_err n_inst subject parts=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --test)   mode="test" ;;
+            --print)  mode="print" ;;
+            --always) always=1 ;;
+            *) die "unknown report option: $1 (use --test, --print or --always)" ;;
+        esac
+        shift
+    done
+    load_conf
+    [ "$REPORT_ALWAYS" == "yes" ] && always=1
+    [ "$mode" == "print" ] || [ -n "$REPORT_EMAIL" ] \
+        || die "no report address set: sudo $MARKER install --report-email you@example.com"
+    host="$(hostname -f 2>/dev/null || hostname)"
+
+    if [ "$mode" == "test" ]; then
+        printf '%s\n' "This is a test mail from $MARKER $VERSION on $host." "" \
+            "Daily reports go to: $REPORT_EMAIL at $REPORT_TIME" \
+            "Sent via: ${SMTP_URL:-local sendmail}" \
+            | send_mail "[$host] $MARKER: test mail" || die "sending failed - check the SMTP settings"
+        info "Test mail sent to $REPORT_EMAIL"
+        exit 0
+    fi
+
+    # State: "<lines already reported> <time of last report>"
+    mkdir -p "$STATE_DIR"
+    local done_lines total state
+    now="$(date +%s)"
+    state="$(cat "$STATE_DIR/last-report" 2>/dev/null)"
+    done_lines="${state%% *}"; last="${state##* }"
+    [[ "$done_lines" =~ ^[0-9]+$ ]] || done_lines=0
+    [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt 0 ] || last=$(( now - 86400 ))
+    total="$(wc -l < "$EVENT_LOG" 2>/dev/null || echo 0)"
+    [ "$done_lines" -gt "$total" ] && done_lines=0          # log was trimmed or replaced
+    events="$(tail -n +"$(( done_lines + 1 ))" "$EVENT_LOG" 2>/dev/null)"
+
+    n_rem=$(grep -c ' REMOVED ' <<<"$events"); n_fail=$(grep -c ' FAILED ' <<<"$events")
+    n_held=$(grep -c ' HELD ' <<<"$events");   n_upd=$(grep -c ' UPDATED ' <<<"$events")
+    n_err=$(grep -c ' ERROR ' <<<"$events");   n_inst=$(grep -c ' INSTALLED ' <<<"$events")
+    [ -z "$events" ] && { n_rem=0; n_fail=0; n_held=0; n_upd=0; n_err=0; n_inst=0; }
+
+    if [ -z "$events" ] && [ -z "$always" ] && [ "$mode" == "send" ]; then
+        echo "$total $now" > "$STATE_DIR/last-report"
+        exit 0      # nothing happened, no mail
+    fi
+
+    [ "$n_rem" -gt 0 ]  && parts+=("$n_rem removed")
+    [ "$n_fail" -gt 0 ] && parts+=("$n_fail FAILED")
+    [ "$n_held" -gt 0 ] && parts+=("held back")
+    [ "$n_err" -gt 0 ]  && parts+=("errors")
+    [ "$n_upd" -gt 0 ]  && parts+=("updated")
+    [ "$n_inst" -gt 0 ] && parts+=("settings changed")
+    [ ${#parts[@]} -eq 0 ] && parts+=("no changes")
+    subject="[$host] $MARKER: $(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')"
+
+    section() {   # $1 = type, $2 = heading. Repeated messages are shown once with a count.
+        local lines
+        lines="$(grep " $1 " <<<"$events" | awk '{
+                    t = $2 " " $3; $1 = $2 = $3 = $4 = ""; sub(/^ +/, "")
+                    if (!($0 in n)) order[++k] = $0
+                    n[$0]++; if (!($0 in first)) first[$0] = t; lastt[$0] = t
+                 } END {
+                    for (i = 1; i <= k; i++) { m = order[i]
+                        if (n[m] == 1) print "  " lastt[m] "  " m
+                        else print "  " first[m] " - " lastt[m] "  " m "  (" n[m] " times)" }
+                 }')"
+        [ -z "$lines" ] && return
+        echo "$2"; echo "$lines"; echo
+    }
+    body() {
+        echo "Report from $MARKER $VERSION on $host"
+        echo "Period: $(date -d "@$last" '+%F %T' 2>/dev/null || echo "$last") - $(date -d "@$now" '+%F %T' 2>/dev/null || echo "$now")"
+        echo
+        if [ -z "$events" ]; then
+            echo "Nothing happened. All zones the primaries no longer serve were already gone."
+            echo
+        fi
+        section FAILED  "FAILED - needs attention:"
+        section HELD    "Held back - a primary did not answer (is it down?):"
+        section ERROR   "Errors:"
+        section REMOVED "Removed zones:"
+        section UPDATED "Script updated:"
+        section INSTALLED "Installed / settings changed:"
+        echo "Settings: every $INTERVAL, zone files $( [ "$FILES" == yes ] && echo deleted || echo kept ), auto-update $AUTO_UPDATE"
+        echo "Full log: $EVENT_LOG on $host"
+    }
+
+    if [ "$mode" == "print" ]; then
+        echo "Subject: $subject"; echo; body
+        exit 0
+    fi
+    if body | send_mail "$subject"; then
+        echo "$total $now" > "$STATE_DIR/last-report"
+        info "Report sent to $REPORT_EMAIL"
+    else
+        logger -t "$TAG" -- "ERROR: sending the daily report failed" 2>/dev/null
+        die "sending the report failed - events are kept for the next report"
+    fi
+
+    # Keep the event log small
+    if [ "$total" -gt 10000 ]; then
+        tail -n 5000 "$EVENT_LOG" > "$EVENT_LOG.tmp" && mv -f "$EVENT_LOG.tmp" "$EVENT_LOG" \
+            && echo "$(wc -l < "$EVENT_LOG") $now" > "$STATE_DIR/last-report"
+    fi
+    exit 0
+}
+
 cmd_uninstall() {
     remove_schedules
     rm -f "$CONF_FILE" "$SCRIPT_PATH"
-    log_sys "uninstalled"
+    rm -rf "$STATE_DIR"     # the event log in /var/log is kept
+    logger -t "$TAG" -- "uninstalled" 2>/dev/null || true
     info "Removed schedule, $CONF_FILE and $SCRIPT_PATH. BIND and its zones are untouched."
     exit 0
 }
@@ -429,21 +705,26 @@ cmd_status() {
     echo "$MARKER $VERSION"
     if [ -f "$CONF_FILE" ]; then
         echo "Settings: every $INTERVAL, files $FILES, auto-update $AUTO_UPDATE (ref $REF)"
+        if [ -n "$REPORT_EMAIL" ]; then
+            echo "Report:   to $REPORT_EMAIL at $REPORT_TIME, $( [ "$REPORT_ALWAYS" == yes ] && echo "every day" || echo "only on changes" ), via ${SMTP_URL:-local sendmail}"
+        else
+            echo "Report:   off (enable: sudo $MARKER install --report-email you@example.com)"
+        fi
     else
         echo "Not installed as a scheduled job (run: sudo $MARKER install)"
     fi
     echo "Log source: $(log_source)"
     if has_systemd && [ -f "$UNIT_DIR/$MARKER.timer" ]; then
         echo
-        systemctl list-timers --all "$MARKER.timer" "$MARKER-update.timer" --no-pager 2>/dev/null
+        systemctl list-timers --all "$MARKER.timer" "$MARKER-update.timer" "$MARKER-report.timer" --no-pager 2>/dev/null
         echo
         echo "Last runs:"
-        as_root journalctl -u "$MARKER.service" -u "$MARKER-update.service" -n 20 --no-pager -o short 2>/dev/null
+        as_root journalctl -u "$MARKER.service" -u "$MARKER-update.service" -u "$MARKER-report.service" -n 20 --no-pager -o short 2>/dev/null
     elif [ -f "$CRON_FILE" ] || grep -qs "# BEGIN $MARKER" /etc/crontabs/root; then
-        echo; echo "cron:"; cat "$CRON_FILE" 2>/dev/null || sed -n "/# BEGIN $MARKER/,/# END $MARKER/p" /etc/crontabs/root
-        echo; echo "Recent removals (syslog):"
-        { as_root grep -h "$TAG" /var/log/syslog /var/log/messages 2>/dev/null || true; } | tail -n 20
+        echo; echo "cron:"; cat "$CRON_FILE" 2>/dev/null || sed -n "/# BEGIN $MARKER/,/# END $MARKER/p" /etc/crontabs/root 2>/dev/null
     fi
+    echo; echo "Recent events ($EVENT_LOG):"
+    { as_root cut -d' ' -f2- "$EVENT_LOG" 2>/dev/null || echo "  none yet"; } | tail -n 15
     exit 0
 }
 
@@ -452,6 +733,7 @@ case "${1:-}" in
     update)    need_root "$@"; shift; cmd_update "$@" ;;
     uninstall) need_root "$@"; shift; cmd_uninstall "$@" ;;
     status)    shift; cmd_status "$@" ;;
+    report)    need_root "$@"; shift; cmd_report "$@" ;;
     version|--version) echo "$MARKER $VERSION"; exit 0 ;;
 esac
 
@@ -466,6 +748,9 @@ usage() {
     echo "Usage: $(basename "$0") [IP-ADDRESS] [yes/no] [dryrun]"
     echo "       $(basename "$0") <ZONE> [ZONE...] [yes/no] [dryrun] [force]"
     echo "       $(basename "$0") install [--interval 1h] [--keep-files] [--auto-update] [--ref main]"
+    echo "               [--report-email a@b.se] [--report-time 07:00] [--report-always]"
+    echo "               [--smtp smtps://host:465 --smtp-user user] [--mail-from addr]"
+    echo "       $(basename "$0") report [--test|--print|--always]"
     echo "       $(basename "$0") update | status | uninstall | version"
     exit 1
 }
@@ -771,7 +1056,7 @@ for k in "${!TIMEOUT_BY_PRIMARY[@]}"; do
     fi
     if [ "$keep" -eq 0 ]; then
         echo "  Holding back the $n zones of primary $k."
-        log_sys "held back $n zones: primary $k timing out - may be down"
+        log_event HELD "$n zones of primary $k held back: primary does not answer, may be down"
         NEW=()
         for ZONE in "${TO_REMOVE[@]}"; do
             if [ "${LIVE[$ZONE]}" == "TIMEOUT" ] && [ "${PRIMARY[$ZONE]:-unknown}" == "$k" ]; then
@@ -826,7 +1111,7 @@ for ZONE in "${TO_REMOVE[@]}"; do
     # shellcheck disable=SC2086  # DELETE_FLAG is either empty or -clean
     if ! as_root rndc delzone $DELETE_FLAG "$ZONE"; then
         echo "  ERROR: rndc delzone failed for $ZONE"
-        log_sys "FAILED to remove zone $ZONE (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
+        log_event FAILED "$ZONE: rndc delzone failed (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
         FAILED=$((FAILED + 1))
         continue
     fi
@@ -838,7 +1123,7 @@ for ZONE in "${TO_REMOVE[@]}"; do
     done
     if zone_exists_locally "$ZONE"; then
         echo "  ERROR: $ZONE is still loaded in BIND"
-        log_sys "FAILED: zone $ZONE still loaded after rndc delzone"
+        log_event FAILED "$ZONE: still loaded in BIND after rndc delzone"
         FAILED=$((FAILED + 1))
         continue
     fi
@@ -852,10 +1137,10 @@ for ZONE in "${TO_REMOVE[@]}"; do
             fi
         done
         echo "  OK: zone removed and zone files deleted"
-        log_sys "removed zone $ZONE and its files (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
+        log_event REMOVED "$ZONE, zone files deleted (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
     else
         echo "  OK: zone removed, zone files kept${FILES[0]:+ (${FILES[0]})}"
-        log_sys "removed zone $ZONE, files kept (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
+        log_event REMOVED "$ZONE, zone files kept (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
     fi
     REMOVED=$((REMOVED + 1))
 done

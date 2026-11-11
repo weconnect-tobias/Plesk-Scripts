@@ -36,8 +36,8 @@ Every finding is mapped to its site. For suspicious files, the script also looks
 ## Installation
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-compromise-check/plesk-compromise-check.sh \
-  -o /usr/local/sbin/plesk-compromise-check
+sudo wget -qO /usr/local/sbin/plesk-compromise-check \
+  https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-compromise-check/plesk-compromise-check.sh
 sudo chmod 755 /usr/local/sbin/plesk-compromise-check
 ```
 

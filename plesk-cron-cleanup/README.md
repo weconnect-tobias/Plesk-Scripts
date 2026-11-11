@@ -30,8 +30,8 @@ For wrong-owner crontabs it shows the first lines of each file, so you can check
 ## Installation
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-cron-cleanup/plesk-cron-cleanup.sh \
-  -o /usr/local/sbin/plesk-cron-cleanup
+sudo wget -qO /usr/local/sbin/plesk-cron-cleanup \
+  https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-cron-cleanup/plesk-cron-cleanup.sh
 sudo chmod 755 /usr/local/sbin/plesk-cron-cleanup
 ```
 

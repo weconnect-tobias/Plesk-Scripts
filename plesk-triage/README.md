@@ -42,8 +42,8 @@ plesk-triage
 ## Installation
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-triage/plesk-triage.sh \
-  -o /usr/local/sbin/plesk-triage
+sudo wget -qO /usr/local/sbin/plesk-triage \
+  https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-triage/plesk-triage.sh
 sudo chmod 755 /usr/local/sbin/plesk-triage
 ```
 

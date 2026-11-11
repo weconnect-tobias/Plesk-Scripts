@@ -85,8 +85,8 @@ It can be combined with `--fix`. Like `--fix`, it shows the plan and asks per si
 ## Installation
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-wp-integrity/plesk-wp-integrity.sh \
-  -o /usr/local/sbin/plesk-wp-integrity
+sudo wget -qO /usr/local/sbin/plesk-wp-integrity \
+  https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-wp-integrity/plesk-wp-integrity.sh
 sudo chmod 755 /usr/local/sbin/plesk-wp-integrity
 ```
 

@@ -76,7 +76,7 @@ If `wget` is missing, use `curl -fsSL` instead of `wget -qO-`.
 2. Puts the script in `/usr/local/sbin/plesk-slave-zone-cleanup`, writing it atomically so you never get a half-written file
 3. Checks that `rndc` can talk to BIND, that `allow-new-zones` is on, and where named logs: `/var/log/syslog`, `/var/log/messages` or the systemd journal
 4. Schedules the cleanup: a systemd timer where systemd is available, otherwise `/etc/cron.d`, or `/etc/crontabs/root` on Alpine
-5. Saves the settings in `/etc/plesk-slave-zone-cleanup.conf`
+5. Saves the settings in `/etc/plesk-slave-zone-cleanup.conf` (readable by root only)
 
 Then check what the first run would do:
 
@@ -95,6 +95,59 @@ sudo plesk-slave-zone-cleanup install --ref v1.0.0        # branch or tag to ins
 ```
 
 Run `install` again at any time to change a setting. Settings you don't mention are kept.
+
+### Daily mail report
+
+Get a mail every morning when something has happened: zones removed, removals that failed, zones held back because a primary seems down, or the script updated. Nothing happened means no mail.
+
+With an SMTP server (no local mail server needed):
+
+```bash
+sudo plesk-slave-zone-cleanup install --report-email ops@example.com \
+    --smtp smtps://smtp.example.com:465 --smtp-user noreply@example.com
+```
+
+The script asks for the SMTP password. You can also give it as `SMTP_PASSWORD=... ` in front of the command when you script the install. The password is stored in `/etc/plesk-slave-zone-cleanup.conf`, which only root can read, and it is passed to `curl` through stdin so it never shows up in `ps`. Use `smtps://host:465` for TLS or `smtp://host:587` for STARTTLS. TLS is always required.
+
+If the server already has a working local mail server (`sendmail`, e.g. Postfix), leave out `--smtp`:
+
+```bash
+sudo plesk-slave-zone-cleanup install --report-email ops@example.com
+```
+
+Then check that mail gets through:
+
+```bash
+sudo plesk-slave-zone-cleanup report --test     # send a test mail now
+sudo plesk-slave-zone-cleanup report --print    # show the next report without sending it
+```
+
+| Option | Meaning |
+|---|---|
+| `--report-email a@example.com,b@example.com` | Where to send the report (comma separated) |
+| `--report-time 07:00` | When to send it (default 07:00) |
+| `--report-always` | Send a mail every day, also when nothing happened. A missing mail then tells you something is wrong. |
+| `--report-changes` | Back to only mailing when something happened (default) |
+| `--mail-from addr` | Sender. Default: the SMTP login if it is an address, otherwise `plesk-slave-zone-cleanup@<host>` |
+| `--no-report` / `--no-smtp` | Turn the report or the SMTP server off |
+
+Example report:
+
+```
+Subject: [ns3.example.com] plesk-slave-zone-cleanup: 2 removed, held back
+
+Report from plesk-slave-zone-cleanup 1.0.0 on ns3.example.com
+Period: 2026-11-11 07:00:02 - 2026-11-12 07:00:01
+
+Held back - a primary did not answer (is it down?):
+  2026-11-11 21:00:03 - 2026-11-11 23:00:02  11 zones of primary 192.0.2.30 held back: primary does not answer, may be down  (3 times)
+
+Removed zones:
+  2026-11-11 14:00:05  example.com, zone files deleted (DISABLED, primary 192.0.2.10)
+  2026-11-11 14:00:05  example.net, zone files deleted (DISABLED, primary 192.0.2.10)
+```
+
+Every event is also written to `/var/log/plesk-slave-zone-cleanup.log`. `status` shows the latest events. If a report can't be sent, its events are kept and included in the next report.
 
 ### Updates
 
@@ -158,8 +211,7 @@ LOGFILE=/var/log/named/named.log plesk-slave-zone-cleanup dryrun
 - If `yes`/`no` is not given, zone files are deleted.
 - The "primary may be down" check (10+ zones of one primary that only time out) holds those zones back instead of asking, and the script exits with code 2.
 - Only one run at a time. A second run started while one is going exits immediately.
-- Every removal and failure is logged with the tag `plesk-slave-zone-cleanup`:
-  `journalctl -t plesk-slave-zone-cleanup` or `sudo grep plesk-slave-zone-cleanup /var/log/syslog`
+- Every removal and failure is logged to `/var/log/plesk-slave-zone-cleanup.log` and to syslog with the tag `plesk-slave-zone-cleanup` (`journalctl -t plesk-slave-zone-cleanup`)
 
 To remove a zone on every secondary from your workstation:
 
