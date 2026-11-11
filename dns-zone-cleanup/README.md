@@ -67,22 +67,41 @@ sudo dns-zone-cleanup install --delegation off
 
 ### On a primary (master) server
 
-Installed on a primary, for example a Plesk server, the script changes nothing: there are no secondary zones to clean up, and zones this server is primary for are never touched. It says so:
+Installed on a primary, for example a Plesk server, the script by default changes nothing: there are no secondary zones to clean up, and primary zones are only checked and reported. It says so:
 
 ```
 This server is primary for 412 zone(s) and has no secondary zones.
 Secondary zones are what dns-zone-cleanup cleans up; primary zones are only checked and reported, never changed.
 ```
 
-It does run a daily, **report-only** check of the primary zones. That catches the old-server case: a domain that has moved to another DNS host, or has expired, while this server still serves its zone. A primary is usually not in the domain's NS records itself, so here the TLD's NS records are compared with the NS records **in the zone**:
+It does run a daily check of the primary zones. That catches the old-server case: a domain that has moved to another primary or DNS host, or has expired, while this server still serves its zone. A primary is usually not in the domain's NS records itself. So the script first compares the TLD's NS records with the NS records **in the zone**. When they differ, it compares the zone's SOA (primary name and serial) here with what the delegated nameservers serve:
 
 | Status | Meaning |
 |---|---|
-| `OURS` | The TLD delegates to the zone's own nameservers, to other names with the same addresses, or to nameservers that serve the same SOA serial as this server (they get the zone from here) |
-| `MOVED` | The TLD delegates to other nameservers, and they serve a different version of the zone. This server has a stale copy. |
+| `OURS` | The TLD delegates to the zone's own nameservers, to other names with the same addresses, or to nameservers that serve the same SOA serial (they get the zone from here) |
+| `MOVED` | The delegated nameservers serve a version from **another primary** (other name in the SOA), or a newer one. This server has a stale copy. |
+| `BEHIND` | The delegated nameservers have the same primary in their SOA but an **older** serial. They don't get updates from this server: are zone transfers or NOTIFY failing? |
+| `ELSEWHERE` | Delegated to other nameservers, but their SOA could not be read |
 | `UNREG` | The domain no longer exists at the TLD |
 
-Each stale zone is reported twice in the mail report: the day it is found, and again after `--delegation-days` days if it stays like that. The report includes the command to switch it off; on Plesk that is `plesk bin dns --off example.se`. `dns-zone-cleanup delegation` shows the table for all primary zones.
+The SOA details are shown and reported, for example `here: ns.example.net serial 2023070700 - at ns1.example.org: ns2.example.org serial 2026071502`. That tells you at a glance whether the zone has moved.
+
+Each zone is reported twice in the mail report: the day it is found, and again after `--delegation-days` days if it stays like that. The report includes the command to switch it off; on Plesk that is `plesk bin dns --off example.se`.
+
+`dns-zone-cleanup delegation` shows every zone that is not OK. Add `verbose` to also list the OK ones and the zones that are not checked (`*.arpa`, `localhost`).
+
+#### Removing stale primary zones automatically (opt-in)
+
+```bash
+sudo dns-zone-cleanup install --primary-zones comment
+```
+
+After `--delegation-days` days, the script then comments out primary zones in the same way as secondary zones (backup, `named-checkconf`, reload), but only when the evidence is unambiguous:
+
+- `UNREG`: the domain has not existed at the TLD at any daily check for 7 days, or
+- `MOVED` **with another primary name in the SOA**, like a zone that has moved to another server
+
+`MOVED` with the same SOA name, `ELSEWHERE` and `BEHIND` are only reported. The zone file of a removed primary zone is **always archived** (`/var/backups/dns-zone-cleanup/<time>/zones/`), never deleted, whatever `--delete-files` says: it is the original. On Plesk servers nothing is removed, because Plesk would write the zone back. Use the `plesk bin dns --off` command from the report there. Default: `--primary-zones report`.
 
 Zones that should never be touched by any check:
 
@@ -225,6 +244,7 @@ sudo dns-zone-cleanup install --delegation report   # only report them
 sudo dns-zone-cleanup install --delegation-days 14  # wait longer before removing
 sudo dns-zone-cleanup install --own-ips "198.51.100.53"  # this server's public addresses (NAT)
 sudo dns-zone-cleanup install --exclude "example.se *.lab.example.se"  # never touch these
+sudo dns-zone-cleanup install --primary-zones comment   # on a primary: also remove unambiguous stale primary zones
 sudo dns-zone-cleanup install --auto-update       # update itself daily at ~04:00
 sudo dns-zone-cleanup install --ref main          # follow VERSION on the main branch (default)
 sudo dns-zone-cleanup install --ref latest        # follow GitHub releases instead
@@ -244,7 +264,22 @@ sudo dns-zone-cleanup install --report-email ops@example.com \
     --smtp smtps://smtp.example.com:465 --smtp-user noreply@example.com
 ```
 
-The script asks for the SMTP password. You can also give it as `SMTP_PASSWORD=... ` in front of the command when you script the install. The password is stored in `/etc/dns-zone-cleanup.conf`, which only root can read, and it is passed to `curl` through stdin so it never shows up in `ps`. Use `smtps://host:465` for TLS or `smtp://host:587` for STARTTLS. TLS is always required.
+The script asks for the SMTP password, also in the one-line `wget ... | sudo bash -s install`. When you script the install, put `SMTP_PASSWORD=...` in front of the command instead. The password is stored in `/etc/dns-zone-cleanup.conf`, which only root can read, and it is passed to `curl` through stdin so it never shows up in `ps`. Use `smtps://host:465` for TLS or `smtp://host:587` for STARTTLS.
+
+**A relay that allows this server by IP (no password):**
+
+```bash
+sudo dns-zone-cleanup install --report-email ops@example.com \
+    --smtp smtp://relay.example.com:25 --no-smtp-auth --smtp-tls try --mail-from dns@example.com
+```
+
+| `--smtp-tls` | Meaning |
+|---|---|
+| `require` (default) | Encrypted or nothing: STARTTLS on `smtp://`, TLS on `smtps://` |
+| `try` | STARTTLS if the server offers it, otherwise plain. Good for internal relays. |
+| `off` | Plain SMTP. Only allowed without a login, so a password is never sent unencrypted. |
+
+Give `--mail-from` with an address the relay accepts. Without a login there is no SMTP user to take it from.
 
 If the server already has a working local mail server (`sendmail`, e.g. Postfix), leave out `--smtp`:
 
@@ -266,6 +301,8 @@ sudo dns-zone-cleanup report --print    # show the next report without sending i
 | `--report-always` | Send a mail every day, also when nothing happened. A missing mail then tells you something is wrong. |
 | `--report-changes` | Back to only mailing when something happened (default) |
 | `--mail-from addr` | Sender. Default: the SMTP login if it is an address, otherwise `dns-zone-cleanup@<host>` |
+| `--smtp-user user` / `--no-smtp-auth` | Log in to the SMTP server / don't log in (relay that allows this server by IP) |
+| `--smtp-tls require\|try\|off` | Encryption, see above (default: require) |
 | `--no-report` / `--no-smtp` | Turn the report or the SMTP server off |
 
 Example report:

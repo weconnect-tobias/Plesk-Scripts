@@ -56,6 +56,9 @@
 #       Mail report: [--report-email a@example.com[,b@example.com]] [--report-time 07:00]
 #                    [--report-always|--report-changes] [--no-report] [--mail-from addr]
 #                    [--smtp smtps://smtp.example.com:465 --smtp-user user] [--no-smtp]
+#                    [--no-smtp-auth] [--smtp-tls require|try|off]   (relay without login)
+#       Primary zones: [--primary-zones report|comment]  (comment = remove unambiguous
+#                    stale primary zones after --delegation-days; zone files are archived)
 #       Without --smtp the local sendmail is used. The SMTP password is asked for (or taken
 #       from SMTP_PASSWORD=...) and stored in /etc/dns-zone-cleanup.conf (root only).
 #   dns-zone-cleanup report      Mail what happened since the last report (nothing happened =
@@ -98,7 +101,7 @@ TAG="dns-zone-cleanup"
 EVENT_LOG="/var/log/dns-zone-cleanup.log"   # events for the daily mail report
 
 # Log an event to syslog/journal and to our own event log.
-# Types: REMOVED FAILED HELD MANUAL PENDING STALEPRIMARY UPDATED INSTALLED ERROR
+# Types: REMOVED FAILED HELD MANUAL PENDING STALEPRIMARY BEHIND UPDATED INSTALLED ERROR
 log_event() {
     local type="$1"; shift
     logger -t "$TAG" -- "$type: $*" 2>/dev/null || true
@@ -110,7 +113,7 @@ log_event() {
 # Installation, updates and scheduling
 # ---------------------------------------------------------------------------
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 REPO_RAW="${PSZC_REPO_RAW:-https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts}"   # override only for testing
 REPO_API="${PSZC_REPO_API:-https://api.github.com/repos/weconnect-tobias/Plesk-Scripts}"
 TAG_PREFIX="dns-zone-cleanup-v"   # releases of this script are tagged dns-zone-cleanup-v1.2.3
@@ -245,12 +248,12 @@ put_script() {
     return 0
 }
 
-CONF_KEYS="REF INTERVAL FILES CONF_ZONES DELEGATION DELEGATION_DAYS OWN_IPS EXCLUDE_ZONES AUTO_UPDATE REPORT_EMAIL REPORT_TIME REPORT_ALWAYS MAIL_FROM SMTP_URL SMTP_USER SMTP_PASS"
+CONF_KEYS="REF INTERVAL FILES CONF_ZONES DELEGATION DELEGATION_DAYS OWN_IPS EXCLUDE_ZONES AUTO_UPDATE REPORT_EMAIL REPORT_TIME REPORT_ALWAYS MAIL_FROM SMTP_URL SMTP_TLS SMTP_USER SMTP_PASS PRIMARY_ZONES"
 load_conf() {
     REF="main"; INTERVAL="1h"; FILES="delete"; CONF_ZONES="comment"; AUTO_UPDATE="no"
     DELEGATION="on"; DELEGATION_DAYS="7"; OWN_IPS=""; EXCLUDE_ZONES=""
     REPORT_EMAIL=""; REPORT_TIME="07:00"; REPORT_ALWAYS="no"
-    MAIL_FROM=""; SMTP_URL=""; SMTP_USER=""; SMTP_PASS=""
+    MAIL_FROM=""; SMTP_URL=""; SMTP_TLS="require"; SMTP_USER=""; SMTP_PASS=""; PRIMARY_ZONES="report"
     # The file holds the SMTP password and is only readable by root
     if [ -f "$CONF_FILE" ]; then
         if [ -r "$CONF_FILE" ]; then
@@ -265,6 +268,8 @@ load_conf() {
     case "$CONF_ZONES" in comment|skip) ;; *) CONF_ZONES="comment" ;; esac
     case "$DELEGATION" in on|report|off) ;; *) DELEGATION="on" ;; esac
     [[ "$DELEGATION_DAYS" =~ ^[0-9]+$ ]] && [ "$DELEGATION_DAYS" -ge 1 ] || DELEGATION_DAYS=7
+    case "$SMTP_TLS" in require|try|off) ;; *) SMTP_TLS="require" ;; esac
+    case "$PRIMARY_ZONES" in report|comment) ;; *) PRIMARY_ZONES="report" ;; esac
 }
 save_conf() {
     local k
@@ -475,7 +480,7 @@ migrate_legacy() {
 
 cmd_install() {
     local new_ref="" new_interval="" new_files="" new_auto="" src=""
-    local opt_deleg="" opt_ddays="" opt_own="" opt_excl="" opt_conf="" opt_email="" opt_rtime="" opt_ralways="" opt_from="" opt_smtp="" opt_suser=""
+    local opt_deleg="" opt_ddays="" opt_own="" opt_excl="" opt_conf="" opt_email="" opt_rtime="" opt_ralways="" opt_from="" opt_smtp="" opt_suser="" opt_stls="" opt_pz=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --interval)       new_interval="${2:-}"; shift ;;
@@ -512,6 +517,11 @@ cmd_install() {
             --smtp-user)      opt_suser="${2:-}"; shift ;;
             --smtp-user=*)    opt_suser="${1#*=}" ;;
             --no-smtp)        opt_smtp="-" ;;
+            --no-smtp-auth)   opt_suser="-" ;;
+            --smtp-tls)       opt_stls="${2:-}"; shift ;;
+            --smtp-tls=*)     opt_stls="${1#*=}" ;;
+            --primary-zones)  opt_pz="${2:-}"; shift ;;
+            --primary-zones=*) opt_pz="${1#*=}" ;;
             *) die "unknown install option: $1" ;;
         esac
         shift
@@ -552,9 +562,17 @@ cmd_install() {
     if [ "$opt_smtp" == "-" ]; then SMTP_URL=""; SMTP_USER=""; SMTP_PASS=""
     elif [ -n "$opt_smtp" ]; then SMTP_URL="$opt_smtp"
     fi
-    if [ -n "$opt_suser" ]; then
+    if [ "$opt_suser" == "-" ]; then
+        SMTP_USER=""; SMTP_PASS=""            # relay that allows this server by IP, no login
+    elif [ -n "$opt_suser" ]; then
         [ "$opt_suser" != "$SMTP_USER" ] && SMTP_PASS=""
         SMTP_USER="$opt_suser"
+    fi
+    if [ -n "$opt_stls" ]; then
+        case "$opt_stls" in require|try|off) SMTP_TLS="$opt_stls" ;; *) die "--smtp-tls must be require, try or off" ;; esac
+    fi
+    if [ -n "$opt_pz" ]; then
+        case "$opt_pz" in report|comment) PRIMARY_ZONES="$opt_pz" ;; *) die "--primary-zones must be report or comment" ;; esac
     fi
 
     # Mail settings
@@ -577,15 +595,24 @@ cmd_install() {
         [[ "$MAIL_FROM" =~ $email_re ]] || die "invalid --mail-from address '$MAIL_FROM'"
         if [ -n "$SMTP_URL" ]; then
             [[ "$SMTP_URL" =~ ^smtps?://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]] \
-                || die "invalid --smtp '$SMTP_URL' (use smtps://host:465 or smtp://host:587)"
+                || die "invalid --smtp '$SMTP_URL' (use smtps://host:465, smtp://host:587 or smtp://host:25)"
+            [[ "$SMTP_URL" == smtps://* ]] && [ "$SMTP_TLS" == "off" ] && die "--smtp-tls off can't be used with smtps:// (use smtp://)"
+            if [ -n "$SMTP_USER" ] && [ "$SMTP_TLS" == "off" ]; then
+                die "won't send an SMTP password without encryption - use --smtp-tls require/try, or --no-smtp-auth for a relay that allows this server by IP"
+            fi
             if [ -n "$SMTP_USER" ] && [ -z "$SMTP_PASS" ]; then
                 if [ -n "${SMTP_PASSWORD:-}" ]; then
                     SMTP_PASS="$SMTP_PASSWORD"
                 elif interactive; then
                     read -r -s -p "SMTP password for $SMTP_USER: " SMTP_PASS; echo
+                elif { : </dev/tty; } 2>/dev/null; then
+                    # Installed through a pipe (wget ... | sudo bash -s install): ask on the terminal
+                    printf 'SMTP password for %s: ' "$SMTP_USER" >/dev/tty
+                    read -r -s SMTP_PASS </dev/tty; echo >/dev/tty
                 else
                     die "SMTP password needed: run interactively or set SMTP_PASSWORD=..."
                 fi
+                [ -n "$SMTP_PASS" ] || die "no SMTP password given"
             fi
         elif ! command -v sendmail >/dev/null 2>&1 && [ ! -x /usr/sbin/sendmail ]; then
             die "no local mail server (sendmail) found - give an SMTP server: --smtp smtps://smtp.example.com:465 --smtp-user user@example.com"
@@ -769,9 +796,15 @@ send_mail() {
         # curl config strings: escape backslashes first, then double quotes.
         local cred="$SMTP_USER:$SMTP_PASS"
         cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"
+        local tls=()
+        case "$SMTP_TLS" in
+            require) tls=(--ssl-reqd) ;;   # STARTTLS on smtp://, TLS on smtps:// - or fail
+            try)     tls=(--ssl) ;;        # STARTTLS if the server offers it
+            off)     tls=() ;;             # plain SMTP (internal relay on port 25)
+        esac
         {
-            [ -n "$SMTP_USER" ] && printf 'user = "%s"\n' "$cred"
-        } | curl -sS --ssl-reqd --crlf --connect-timeout 20 --max-time 60 -K - \
+            if [ -n "$SMTP_USER" ]; then printf 'user = "%s"\n' "$cred"; fi
+        } | curl -sS "${tls[@]}" --crlf --connect-timeout 20 --max-time 60 -K - \
                 --url "$SMTP_URL" --mail-from "$MAIL_FROM" "${rcpts[@]}" -T "$msg"
         rc=$?
     else
@@ -784,7 +817,7 @@ send_mail() {
 }
 
 cmd_report() {
-    local mode="send" always="" host now last events n_rem n_fail n_held n_upd n_err n_inst n_man n_pend n_sp subject parts=()
+    local mode="send" always="" host now last events n_rem n_fail n_held n_upd n_err n_inst n_man n_pend n_sp n_beh subject parts=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --test)   mode="test" ;;
@@ -803,8 +836,8 @@ cmd_report() {
     if [ "$mode" == "test" ]; then
         printf '%s\n' "This is a test mail from $MARKER $VERSION on $host." "" \
             "Daily reports go to: $REPORT_EMAIL at $REPORT_TIME" \
-            "Sent via: ${SMTP_URL:-local sendmail}" \
-            | send_mail "[$host] $MARKER: test mail" || die "sending failed - check the SMTP settings"
+            "Sent via: ${SMTP_URL:-local sendmail}${SMTP_URL:+ (TLS: $SMTP_TLS, login: ${SMTP_USER:-none})}" \
+            | send_mail "[$host] $MARKER: test mail" || die "sending failed - check the SMTP settings (relay without encryption? try --smtp-tls try)"
         info "Test mail sent to $REPORT_EMAIL"
         exit 0
     fi
@@ -826,7 +859,8 @@ cmd_report() {
     n_err=$(grep -c ' ERROR ' <<<"$events");   n_inst=$(grep -c ' INSTALLED ' <<<"$events")
     n_man=$(grep ' MANUAL ' <<<"$events" | awk '{print $5}' | sort -u | grep -c .)
     n_pend=$(grep -c ' PENDING ' <<<"$events"); n_sp=$(grep ' STALEPRIMARY ' <<<"$events" | awk '{print $5}' | sort -u | grep -c .)
-    [ -z "$events" ] && { n_rem=0; n_fail=0; n_held=0; n_upd=0; n_err=0; n_inst=0; n_man=0; n_pend=0; n_sp=0; }
+    n_beh=$(grep ' BEHIND ' <<<"$events" | awk '{print $5}' | sort -u | grep -c .)
+    [ -z "$events" ] && { n_rem=0; n_fail=0; n_held=0; n_upd=0; n_err=0; n_inst=0; n_man=0; n_pend=0; n_sp=0; n_beh=0; }
 
     if [ -z "$events" ] && [ -z "$always" ] && [ "$mode" == "send" ]; then
         echo "$total $now" > "$STATE_DIR/last-report"
@@ -839,6 +873,7 @@ cmd_report() {
     [ "$n_man" -gt 0 ]  && parts+=("$n_man to remove by hand")
     [ "$n_pend" -gt 0 ] && parts+=("$n_pend no longer delegated")
     [ "$n_sp" -gt 0 ]   && parts+=("$n_sp stale primary zone(s)")
+    [ "$n_beh" -gt 0 ]  && parts+=("$n_beh zone(s) behind on secondaries")
     [ "$n_err" -gt 0 ]  && parts+=("errors")
     [ "$n_upd" -gt 0 ]  && parts+=("updated")
     [ "$n_inst" -gt 0 ] && parts+=("settings changed")
@@ -869,7 +904,8 @@ cmd_report() {
         fi
         section FAILED  "FAILED - needs attention:"
         section MANUAL  "Stale zones to remove by hand:"
-        section STALEPRIMARY "Primary zones on this server whose domain uses other nameservers (not changed - switch them off if they are no longer needed):"
+        section STALEPRIMARY "Primary zones on this server that are no longer used (switch them off if they are not needed):"
+        section BEHIND  "Primary zones whose secondaries have an older version (zone transfers from this server failing?):"
         section PENDING "No longer delegated to this server (removed after $DELEGATION_DAYS days unless that changes):"
         section HELD    "Held back - a primary did not answer (is it down?):"
         section ERROR   "Errors:"
@@ -923,7 +959,7 @@ cmd_status() {
             done
         fi
         if [ -n "$REPORT_EMAIL" ]; then
-            echo "Report:   to $REPORT_EMAIL at $REPORT_TIME, $( [ "$REPORT_ALWAYS" == yes ] && echo "every day" || echo "only on changes" ), via ${SMTP_URL:-local sendmail}"
+            echo "Report:   to $REPORT_EMAIL at $REPORT_TIME, $( [ "$REPORT_ALWAYS" == yes ] && echo "every day" || echo "only on changes" ), via ${SMTP_URL:-local sendmail}${SMTP_URL:+ (TLS $SMTP_TLS, login ${SMTP_USER:-none})}"
         else
             echo "Report:   off (enable: sudo $MARKER install --report-email you@example.com)"
         fi
@@ -968,7 +1004,8 @@ usage() {
     echo "       $(basename "$0") install [--interval 1h] [--delete-files|--keep-files|--archive-files]"
     echo "               [--conf-zones comment|skip] [--auto-update] [--ref main|latest|v1.0.0]"
     echo "               [--report-email a@b.se] [--report-time 07:00] [--report-always]"
-    echo "               [--smtp smtps://host:465 --smtp-user user] [--mail-from addr]"
+    echo "               [--smtp smtps://host:465 --smtp-user user | --no-smtp-auth] [--smtp-tls require|try|off]"
+    echo "               [--mail-from addr] [--primary-zones report|comment]"
     echo "       $(basename "$0") report [--test|--print|--always]"
     echo "       $(basename "$0") check | update [--force] | status | uninstall | version"
     echo "       (yes = delete, no = keep)"
@@ -1376,7 +1413,7 @@ declare -A DELEG_INFO=()
 # Runs the check (once a day, or always with $1 = force) and adds zones that have been
 # MOVED/UNREG for DELEGATION_DAYS days to REASON. With $1 = show it only prints a table.
 delegation_scan() {
-    local mode="${1:-}" now last zones=() z total=0 bad=0 since prev st ns days_left
+    local mode="${1:-}" now last zones=() z total=0 bad=0 since prev st ns days_left shown_hidden=0
     declare -A OLD_ST=() OLD_SINCE=() NEW=()
     [ "$DELEGATION" == "off" ] && [ "$mode" != "show" ] && return
     now="$(date +%s)"
@@ -1403,12 +1440,12 @@ delegation_scan() {
             if ! command -v named-nzd2nzf >/dev/null 2>&1 && \
                [ -n "$(as_root sh -c "ls -1 '$(bind_directory)'/*.nzd 2>/dev/null")" ]; then
                 echo "Delegation check: zones added with rndc addzone are in an .nzd file, and named-nzd2nzf (part of BIND) is missing - can't list them."
-            else
+            elif [ -z "$(primary_zones | head -n1)" ]; then
                 echo "Delegation check: no secondary zones found in the config."
             fi
             return
         fi
-        [ "$mode" == "show" ] && { echo; row "ZONE" "STATUS" "SINCE" "NAMESERVERS AT THE TLD"; row "----" "------" "-----" "----------------------"; }
+        [ "$mode" == "show" ] && { echo; echo "Secondary zones:"; row "ZONE" "STATUS" "SINCE" "NAMESERVERS AT THE TLD"; row "----" "------" "-----" "----------------------"; }
         declare -A CURRENT=()
         for z in "${zones[@]}"; do CURRENT["$z"]=1; done
         if [ ${#MANUAL_ZONES[@]} -eq 0 ]; then
@@ -1429,10 +1466,14 @@ delegation_scan() {
                 SUBZONE) unset 'NEW[$z]' ;;
             esac
             if [ "$mode" == "show" ]; then
+                if [[ "$DSTATUS" == DELEGATED || "$DSTATUS" == SUBZONE ]] && [ -z "$VERBOSE" ]; then
+                    shown_hidden=$((shown_hidden + 1)); continue
+                fi
                 since="-"; [[ "$DSTATUS" == NOTHERE || "$DSTATUS" == UNREG ]] && since="$(date -d "@$(cut -f3 <<<"${NEW[$z]}")" +%F 2>/dev/null)"
                 row "$z" "$DSTATUS" "$since" "${DNS_LIST:--}"
             fi
         done
+        [ "$mode" == "show" ] && [ "${shown_hidden:-0}" -gt 0 ] && echo "($shown_hidden zone(s) delegated here or not checked - add 'verbose' to list them)"
         echo "Own addresses used: ${!OWN[*]}"
         # Sanity check: if most zones look "not delegated here", our own addresses are
         # probably wrong (NAT, new IP) - don't trust the result
@@ -1499,12 +1540,30 @@ zone_own_ns() {
 
 name_ips() { local n; for n in "$@"; do dig +short +time=3 +tries=1 A "$n" 2>/dev/null; dig +short +time=3 +tries=1 AAAA "$n" 2>/dev/null; done | sort -u; }
 
-# Sets PSTATUS for primary zone $1 (uses delegation_status for the TLD side)
+# SOA of zone $1 as served authoritatively by server $2: prints "<mname> <serial>"
+zone_soa() {
+    local out
+    out="$(dig +norec +time=3 +tries=1 +noall +comments +answer SOA "$1." @"$2" 2>/dev/null)"
+    grep -qE 'flags:[^;]* aa' <<<"$out" || return
+    awk -v z="$1." 'tolower($1) == tolower(z) && $4 == "SOA" { print tolower($5), $7; exit }' <<<"$out" | sed 's/\. / /'
+}
+
+# Sets PSTATUS, PDETAIL and PSTRICT for primary zone $1:
+#   OURS      delegated to the zone's own nameservers, or they serve this server's version
+#   MOVED     the delegated nameservers serve a version from another primary (other SOA name),
+#             or a newer version -> this server has a stale copy
+#   BEHIND    the delegated nameservers have the same primary in their SOA but an older serial
+#             -> they don't get updates from this server (zone transfer / NOTIFY broken?)
+#   ELSEWHERE delegated to other nameservers, but their SOA could not be read
+#   UNREG     the domain no longer exists at the TLD
+# PSTRICT=1 when the evidence is unambiguous (UNREG, or MOVED with another SOA name).
 primary_status() {
-    local z="$1" own tld_ips own_ips n
+    local z="$1" own tld_ips own_ips n mine theirs="" theirs_ns="" my_m my_s th_m th_s
+    PDETAIL=""; PSTRICT=""
     delegation_status "$z"
     case "$DSTATUS" in
-        SUBZONE|UNKNOWN|UNREG) PSTATUS="$DSTATUS"; return ;;
+        SUBZONE|UNKNOWN) PSTATUS="$DSTATUS"; return ;;
+        UNREG) PSTATUS="UNREG"; PSTRICT=1; PDETAIL="the domain does not exist at the TLD"; return ;;
     esac
     own="$(zone_own_ns "$z")"
     [ -z "$own" ] && { PSTATUS="UNKNOWN"; return; }
@@ -1517,27 +1576,24 @@ primary_status() {
     if [ -n "$tld_ips" ] && [ -n "$own_ips" ] && [ -n "$(comm -12 <(echo "$tld_ips") <(echo "$own_ips"))" ]; then
         PSTATUS="OURS"; return
     fi
-    # The delegated nameservers may still get the zone from here (the NS records inside the
-    # zone are just different). Then they serve the same SOA serial as this server.
-    local my_serial their_serial
-    my_serial="$(zone_serial "$z" 127.0.0.1)"
-    [ -z "$my_serial" ] && for n in "${!OWN[@]}"; do my_serial="$(zone_serial "$z" "$n")"; [ -n "$my_serial" ] && break; done
-    if [ -n "$my_serial" ]; then
-        for n in $DNS_LIST; do
-            their_serial="$(zone_serial "$z" "$n")"
-            if [ "$their_serial" == "$my_serial" ]; then PSTATUS="OURS"; return; fi
-            [ -n "$their_serial" ] && break      # one authoritative answer with another serial is enough
-        done
+    # Compare this server's version of the zone with what the delegated nameservers serve
+    mine="$(zone_soa "$z" 127.0.0.1)"
+    if [ -z "$mine" ]; then for n in "${!OWN[@]}"; do mine="$(zone_soa "$z" "$n")"; [ -n "$mine" ] && break; done; fi
+    for n in $DNS_LIST; do
+        theirs="$(zone_soa "$z" "$n")"
+        [ -n "$theirs" ] && { theirs_ns="$n"; break; }
+    done
+    if [ -z "$mine" ] || [ -z "$theirs" ]; then
+        PSTATUS="ELSEWHERE"; PDETAIL="delegated to ${DNS_LIST:-?}; their version could not be read"; return
+    fi
+    read -r my_m my_s <<<"$mine"; read -r th_m th_s <<<"$theirs"
+    PDETAIL="here: $my_m serial $my_s - at $theirs_ns: $th_m serial $th_s"
+    if [ "$th_s" == "$my_s" ]; then PSTATUS="OURS"; return; fi
+    if [ "$th_m" != "$my_m" ]; then PSTATUS="MOVED"; PSTRICT=1; return; fi
+    if [[ "$th_s" =~ ^[0-9]+$ && "$my_s" =~ ^[0-9]+$ ]] && [ "$th_s" -lt "$my_s" ]; then
+        PSTATUS="BEHIND"; return
     fi
     PSTATUS="MOVED"
-}
-
-# SOA serial of zone $1 as served (authoritatively) by server $2
-zone_serial() {
-    local out
-    out="$(dig +norec +time=3 +tries=1 +noall +comments +answer SOA "$1." @"$2" 2>/dev/null)"
-    grep -qE 'flags:[^;]* aa' <<<"$out" || return
-    awk -v z="$1." 'tolower($1) == tolower(z) && $4 == "SOA" { print $7; exit }' <<<"$out"
 }
 
 off_hint() {
@@ -1546,13 +1602,26 @@ off_hint() {
     fi
 }
 
-PRIMARY_STATE="$STATE_DIR/primary-delegation.tsv"   # zone <TAB> status <TAB> since <TAB> ns <TAB> notified
+# zone <TAB> status <TAB> since <TAB> ns <TAB> notified <TAB> strict <TAB> detail
+PRIMARY_STATE="$STATE_DIR/primary-delegation.tsv"
 STALE_PRIMARY_LIST=()
 
+# Fields are never empty in the state file ("-" / 0), since read with IFS=tab would skip them
+pfields() { [ "$ns" == "-" ] && ns=""; [ "$detail" == "-" ] && detail=""; [ "$strict" == "1" ] || strict=""; }
+
+save_primary_state() {
+    local z
+    as_root mkdir -p "$STATE_DIR"
+    for z in "${!PNEW[@]}"; do printf '%s\t%s\n' "$z" "${PNEW[$z]}"; done | as_root tee "$PRIMARY_STATE.tmp" >/dev/null
+    as_root mv -f "$PRIMARY_STATE.tmp" "$PRIMARY_STATE"
+}
+
 # Daily. With $1 = show it only prints a table.
+declare -A PNEW=()
 primary_scan() {
-    local mode="${1:-}" now last zones=() z st since ns notified total=0 bad=0 age
-    declare -A NEW=() OLD=()
+    local mode="${1:-}" now last zones=() z st since ns notified strict detail total=0 bad=0 age what
+    declare -A OLD=()
+    PNEW=()
     [ "$DELEGATION" == "off" ] && [ "$mode" != "show" ] && return
     mapfile -t zones < <(primary_zones)
     [ ${#zones[@]} -eq 0 ] && return
@@ -1560,8 +1629,8 @@ primary_scan() {
     last="$(as_root cat "$STATE_DIR/primary-delegation.last" 2>/dev/null || echo 0)"
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     if as_root test -f "$PRIMARY_STATE"; then
-        while IFS=$'\t' read -r z st since ns notified; do
-            OLD["$z"]="$st"$'\t'"$since"$'\t'"$ns"$'\t'"${notified:-0}"; NEW["$z"]="${OLD[$z]}"
+        while IFS=$'\t' read -r z st since ns notified strict detail; do
+            OLD["$z"]="$st"$'\t'"$since"$'\t'"$ns"$'\t'"${notified:-0}"$'\t'"$strict"$'\t'"$detail"; PNEW["$z"]="${OLD[$z]}"
         done < <(as_root cat "$PRIMARY_STATE")
     fi
 
@@ -1569,64 +1638,89 @@ primary_scan() {
         [ ${#OWN[@]} -eq 0 ] && own_ips_load
         declare -A CURRENT=()
         for z in "${zones[@]}"; do CURRENT["$z"]=1; done
-        for z in "${!NEW[@]}"; do [ -n "${CURRENT[$z]:-}" ] || unset 'NEW[$z]'; done
-        [ "$mode" == "show" ] && { echo; echo "Zones this server is primary for:"; row "ZONE" "STATUS" "SINCE" "NAMESERVERS AT THE TLD"; row "----" "------" "-----" "----------------------"; }
+        for z in "${!PNEW[@]}"; do [ -n "${CURRENT[$z]:-}" ] || unset 'PNEW[$z]'; done
+        [ "$mode" == "show" ] && { echo; echo "Zones this server is primary for:"; row "ZONE" "STATUS" "SINCE" "DETAILS"; row "----" "------" "-----" "-------"; }
+        local hidden=0
         for z in "${zones[@]}"; do
             if [ ${#MANUAL_ZONES[@]} -gt 0 ] && [[ " ${MANUAL_ZONES[*]} " != *" $z "* ]]; then continue; fi
-            is_excluded "$z" && { unset 'NEW[$z]'; [ "$mode" == "show" ] && row "$z" "EXCLUDED" "-" "-"; continue; }
+            if is_excluded "$z"; then
+                unset 'PNEW[$z]'
+                [ "$mode" == "show" ] && { [ -n "$VERBOSE" ] && row "$z" "EXCLUDED" "-" "-" || hidden=$((hidden + 1)); }
+                continue
+            fi
             primary_status "$z"
             case "$PSTATUS" in
-                MOVED|UNREG)
-                    total=$((total + 1)); bad=$((bad + 1))
-                    IFS=$'\t' read -r st since ns notified <<<"${OLD[$z]:-}"
+                MOVED|UNREG|BEHIND|ELSEWHERE)
+                    total=$((total + 1)); [ "$PSTATUS" != "BEHIND" ] && bad=$((bad + 1))
+                    IFS=$'\t' read -r st since ns notified strict detail <<<"${OLD[$z]:-}"; pfields
                     if [ "$st" != "$PSTATUS" ] || [ -z "$since" ]; then since="$now"; notified=0; fi
-                    NEW["$z"]="$PSTATUS"$'\t'"$since"$'\t'"$DNS_LIST"$'\t'"${notified:-0}" ;;
-                OURS)    total=$((total + 1)); unset 'NEW[$z]' ;;
-                SUBZONE) unset 'NEW[$z]' ;;
+                    PNEW["$z"]="$PSTATUS"$'\t'"$since"$'\t'"${DNS_LIST:--}"$'\t'"${notified:-0}"$'\t'"${PSTRICT:-0}"$'\t'"${PDETAIL:--}" ;;
+                OURS)    total=$((total + 1)); unset 'PNEW[$z]' ;;
+                SUBZONE) unset 'PNEW[$z]' ;;
                 UNKNOWN) ;;
             esac
             if [ "$mode" == "show" ]; then
-                since="-"; [ -n "${NEW[$z]:-}" ] && since="$(date -d "@$(cut -f2 <<<"${NEW[$z]}")" +%F 2>/dev/null)"
-                row "$z" "$PSTATUS" "$since" "${DNS_LIST:--}"
+                if [[ "$PSTATUS" == OURS || "$PSTATUS" == SUBZONE ]] && [ -z "$VERBOSE" ]; then
+                    hidden=$((hidden + 1)); continue
+                fi
+                since="-"; [ -n "${PNEW[$z]:-}" ] && since="$(date -d "@$(cut -f2 <<<"${PNEW[$z]}")" +%F 2>/dev/null)"
+                row "$z" "$PSTATUS" "$since" "${PDETAIL:-${DNS_LIST:--}}"
             fi
         done
+        [ "$mode" == "show" ] && [ "$hidden" -gt 0 ] && echo "($hidden zone(s) OK or not checked - add 'verbose' to list them)"
         if [ "$total" -ge 4 ] && [ $(( bad * 2 )) -gt "$total" ]; then
-            echo "WARNING: $bad of $total primary zones look delegated elsewhere - that is unlikely, so nothing is reported. Check: $MARKER delegation"
-            [ "$mode" == "show" ] || [ -n "$DRYRUN" ] || log_event ERROR "primary zone check: $bad of $total zones look delegated elsewhere - ignored, check '$MARKER delegation'"
-            return
+            echo "WARNING: $bad of $total primary zones look delegated elsewhere - that is unlikely, so nothing is reported. Check: $MARKER delegation verbose"
+            [ "$mode" == "show" ] || [ -n "$DRYRUN" ] || log_event ERROR "primary zone check: $bad of $total zones look delegated elsewhere - ignored, check '$MARKER delegation verbose'"
+            PNEW=(); return
         fi
         if [ "$mode" != "show" ] && [ -z "$DRYRUN" ]; then
-            as_root mkdir -p "$STATE_DIR"
-            for z in "${!NEW[@]}"; do printf '%s\t%s\n' "$z" "${NEW[$z]}"; done | as_root tee "$PRIMARY_STATE.tmp" >/dev/null
-            as_root mv -f "$PRIMARY_STATE.tmp" "$PRIMARY_STATE"
+            save_primary_state
             echo "$now" | as_root tee "$STATE_DIR/primary-delegation.last" >/dev/null
         fi
     fi
     [ "$mode" == "show" ] && return
 
-    # Tell about each stale primary zone twice: when it is first seen, and when it has
-    # stayed like that for DELEGATION_DAYS days
+    # Tell about each zone twice: when it is first seen, and when it has stayed like that for
+    # DELEGATION_DAYS days. With --primary-zones comment, unambiguous cases are then removed.
     local changed=""
-    for z in "${!NEW[@]}"; do
-        IFS=$'\t' read -r st since ns notified <<<"${NEW[$z]}"
+    for z in "${!PNEW[@]}"; do
+        IFS=$'\t' read -r st since ns notified strict detail <<<"${PNEW[$z]}"; pfields
         [[ "$since" =~ ^[0-9]+$ ]] || continue
         age=$(( (now - since) / 86400 ))
-        what="$( [ "$st" == UNREG ] && echo "the domain no longer exists at the TLD" || echo "the TLD delegates it to ${ns:-other nameservers}")"
-        STALE_PRIMARY_LIST+=("$z: $what (since $(date -d "@$since" +%F 2>/dev/null)) - $(off_hint "$z")")
+        case "$st" in
+            UNREG)     what="the domain no longer exists at the TLD" ;;
+            MOVED)     what="the domain is served by another primary (${detail:-delegated to $ns})" ;;
+            ELSEWHERE) what="the domain is delegated to ${ns:-other nameservers}, which this server's zone doesn't list" ;;
+            BEHIND)    what="the secondaries ($ns) have an older version (${detail}) - are zone transfers or NOTIFY from this server failing?" ;;
+        esac
+        if [ "$st" == "BEHIND" ]; then
+            STALE_PRIMARY_LIST+=("$z: secondaries are behind - $detail")
+        else
+            STALE_PRIMARY_LIST+=("$z: $what (since $(date -d "@$since" +%F 2>/dev/null)) - $(off_hint "$z")")
+        fi
+        # Remove unambiguous cases after the waiting time, if asked to
+        if [ "$PRIMARY_ZONES" == "comment" ] && [ -n "$strict" ] && [ "$age" -ge "$DELEGATION_DAYS" ] \
+           && [ "$st" != "BEHIND" ] && ! command -v plesk >/dev/null 2>&1 && [ -z "${REASON[$z]:-}" ]; then
+            REASON["$z"]="$( [ "$st" == UNREG ] && echo PUNREG || echo PMOVED)"
+            DELEG_INFO["$z"]="$what, since $(date -d "@$since" +%F 2>/dev/null)"
+        fi
         [ -n "$DRYRUN" ] && continue
         if [ "${notified:-0}" -lt 1 ]; then
-            log_event STALEPRIMARY "$z: $what, but this server is still primary for it - $(off_hint "$z")"
+            if [ "$st" == "BEHIND" ]; then log_event BEHIND "$z: $what"
+            else log_event STALEPRIMARY "$z: $what, but this server still serves it - $(off_hint "$z")"
+            fi
             notified=1; changed=1
         elif [ "$notified" -lt 2 ] && [ "$age" -ge "$DELEGATION_DAYS" ]; then
-            log_event STALEPRIMARY "$z: still $( [ "$st" == UNREG ] && echo "not registered" || echo "delegated to ${ns:-other nameservers}") after $age days - switch it off here: $(off_hint "$z")"
+            if [ "$st" == "BEHIND" ]; then log_event BEHIND "$z: still behind after $age days - $detail"
+            elif [ "$PRIMARY_ZONES" == "comment" ] && [ -n "$strict" ] && ! command -v plesk >/dev/null 2>&1; then :
+            else log_event STALEPRIMARY "$z: still the case after $age days - $what. Switch it off here: $(off_hint "$z")"
+            fi
             notified=2; changed=1
         fi
-        NEW["$z"]="$st"$'\t'"$since"$'\t'"$ns"$'\t'"$notified"
+        PNEW["$z"]="$st"$'\t'"$since"$'\t'"${ns:--}"$'\t'"$notified"$'\t'"${strict:-0}"$'\t'"${detail:--}"
     done
-    if [ -n "$changed" ]; then
-        for z in "${!NEW[@]}"; do printf '%s\t%s\n' "$z" "${NEW[$z]}"; done | as_root tee "$PRIMARY_STATE.tmp" >/dev/null
-        as_root mv -f "$PRIMARY_STATE.tmp" "$PRIMARY_STATE"
-    fi
+    [ -n "$changed" ] && save_primary_state
+    return 0
 }
 
 PENDING_LIST=()
@@ -1731,7 +1825,7 @@ if [ -n "$AUTO" ]; then
             echo "Secondary zones are what $MARKER cleans up; primary zones are only checked and reported, never changed."
         fi
         if [ ${#STALE_PRIMARY_LIST[@]} -gt 0 ]; then
-            echo "Primary zones whose domain no longer uses this server's nameservers (not changed, see the report):"
+            echo "Primary zones that look unused or out of sync (not changed, see the report):"
             printf '  %s\n' "${STALE_PRIMARY_LIST[@]}"
         elif [ "$DELEGATION" != "off" ]; then
             echo "All primary zones checked so far are delegated to their own nameservers."
@@ -1796,6 +1890,7 @@ TO_REMOVE=()
 SKIPPED=()
 ALREADY_GONE=()
 declare -A LIVE=()
+declare -A ZACTION=()    # per-zone file action (primary zones: always archive, never delete)
 
 
 echo
@@ -1811,6 +1906,11 @@ for ZONE in $(printf '%s\n' "${!REASON[@]}" | sort); do
     if is_excluded "$ZONE"; then
         row "$ZONE" "$why" "-" "skip (excluded)"
         SKIPPED+=("$ZONE"); continue
+    fi
+    # Stale primary zone, opted in with --primary-zones comment (checked daily for N days)
+    if [ "$why" == "PMOVED" ] || [ "$why" == "PUNREG" ]; then
+        row "$ZONE" "$why" "-" "REMOVE (${DELEG_INFO[$ZONE]:-})"
+        LIVE["$ZONE"]="$why"; ZACTION["$ZONE"]="archive"; TO_REMOVE+=("$ZONE"); continue
     fi
     # Never touch zones this server is the primary for (or other non-secondary zones)
     ztype="$(zone_type "$ZONE")"
@@ -1960,7 +2060,7 @@ for ZONE in "${TO_REMOVE[@]}"; do
 done
 
 file_note() {
-    local f="${ZFILE[$1]:-}"
+    local f="${ZFILE[$1]:-}" FILE_ACTION="${ZACTION[$1]:-$FILE_ACTION}"
     [ -z "$f" ] && { echo "zone file unknown"; return; }
     [ -z "${ZHASFILE[$1]:-}" ] && { echo "no zone file found ($f)"; return; }
     case "$FILE_ACTION" in
@@ -1988,7 +2088,7 @@ BACKUP_ROOT="/var/backups/$MARKER/$STAMP"
 
 # After a zone is gone from BIND: delete, keep or archive its files
 handle_files() {
-    local zone="$1" f moved=""
+    local zone="$1" f moved="" FILE_ACTION="${ZACTION[$1]:-$FILE_ACTION}"
     shift
     for f in "$@"; do
         case "$FILE_ACTION" in
@@ -2035,7 +2135,7 @@ for ZONE in "${TO_REMOVE[@]}"; do
     [ -n "$out" ] && echo "  $out"
     if [ $rc -ne 0 ]; then
         echo "  ERROR: rndc delzone failed for $ZONE"
-        log_event FAILED "$ZONE: rndc delzone failed: ${out:-no output} (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
+        log_event FAILED "$ZONE: rndc delzone failed: ${out:-no output} (${REASON[$ZONE]}${PRIMARY[$ZONE]:+, primary ${PRIMARY[$ZONE]}})"
         FAILED=$((FAILED + 1)); continue
     fi
     if ! wait_gone "$ZONE"; then
@@ -2045,7 +2145,7 @@ for ZONE in "${TO_REMOVE[@]}"; do
     fi
     handle_files "$ZONE" "${PATHS[@]}"
     echo "  OK: zone removed, $(file_note "$ZONE")"
-    log_event REMOVED "$ZONE, $(file_note "$ZONE") (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
+    log_event REMOVED "$ZONE, $(file_note "$ZONE") (${REASON[$ZONE]}${PRIMARY[$ZONE]:+, primary ${PRIMARY[$ZONE]}})"
     REMOVED=$((REMOVED + 1))
 done
 
@@ -2067,6 +2167,7 @@ if [ ${#CONF_LIST[@]} -gt 0 ]; then
                     why["RETRY"] = "its primary no longer answers for it"; why["DISABLED"] = "its primary no longer has it"
                     why["MOVED"] = "the domain is no longer delegated to this server"; why["UNREG"] = "the domain no longer exists"
                     why["MANUAL"] = "removed with " M
+                    why["PMOVED"] = "the domain is served by another primary"; why["PUNREG"] = "the domain no longer exists"
                     for (i = 1; i <= n; i++) { split(parts[i], x, ":"); s[x[1]] = x[2]; z[x[1]] = x[3]; w[x[1]] = x[4] } }
             { if (NR in s) { e = s[NR]; zn = z[NR]
                   print "# [" M " " D "] zone " zn " removed: " why[w[NR]] ". To restore, remove the \"# \" in front of the lines below." }
@@ -2122,7 +2223,7 @@ if [ ${#CONF_LIST[@]} -gt 0 ]; then
                 note="zone file left alone until BIND is reloaded"   # BIND still has the zone loaded
             fi
             echo "  OK: $ZONE commented out in ${WHERE[$ZONE]%:*}, $note"
-            log_event REMOVED "$ZONE, commented out in ${WHERE[$ZONE]%:*} (backup $BACKUP_ROOT/config), $note (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
+            log_event REMOVED "$ZONE, commented out in ${WHERE[$ZONE]%:*} (backup $BACKUP_ROOT/config), $note (${REASON[$ZONE]}${PRIMARY[$ZONE]:+, primary ${PRIMARY[$ZONE]}})"
             REMOVED=$((REMOVED + 1))
         done
     fi
