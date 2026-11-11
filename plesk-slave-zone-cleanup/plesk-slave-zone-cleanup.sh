@@ -44,7 +44,11 @@
 #   plesk-slave-zone-cleanup report      Mail what happened since the last report (nothing
 #                                        happened = no mail, unless --always / --report-always)
 #       --test   send a test mail     --print   show the report instead of sending it
-#   plesk-slave-zone-cleanup update      Update from GitHub (only if the download is valid)
+#   plesk-slave-zone-cleanup check       Show the installed version and the one on GitHub
+#   plesk-slave-zone-cleanup update      Install the version on GitHub if it is newer (and valid)
+#       --ref main (default) = the main branch; updates when VERSION in the script is raised
+#       --ref latest = newest GitHub release of this script (tag plesk-slave-zone-cleanup-vX.Y.Z)
+#       --ref v1.2.0 = that release only
 #   plesk-slave-zone-cleanup status      Settings, next run and last runs
 #   plesk-slave-zone-cleanup uninstall   Remove schedule, settings and script
 #   plesk-slave-zone-cleanup version
@@ -93,6 +97,8 @@ log_event() {
 
 VERSION="1.0.0"
 REPO_RAW="${PSZC_REPO_RAW:-https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts}"   # override only for testing
+REPO_API="${PSZC_REPO_API:-https://api.github.com/repos/weconnect-tobias/Plesk-Scripts}"
+TAG_PREFIX="plesk-slave-zone-cleanup-v"   # releases of this script are tagged plesk-slave-zone-cleanup-v1.2.3
 SCRIPT_PATH="/usr/local/sbin/plesk-slave-zone-cleanup"
 CONF_FILE="/etc/plesk-slave-zone-cleanup.conf"
 UNIT_DIR="/etc/systemd/system"
@@ -156,6 +162,59 @@ download() {
         return 127
     fi
 }
+
+# --ref values: "latest" (newest release of this script), a version ("v1.2.0" / "1.2.0",
+# turned into the tag plesk-slave-zone-cleanup-v1.2.0), a full tag, or a branch ("main").
+normalize_ref() {
+    case "$1" in
+        "")                                echo "main" ;;
+        latest)                            echo "latest" ;;
+        v[0-9]*.[0-9]*.[0-9]*)             echo "${TAG_PREFIX}${1#v}" ;;
+        [0-9]*.[0-9]*.[0-9]*)              echo "${TAG_PREFIX}$1" ;;
+        *)                                 echo "$1" ;;
+    esac
+}
+
+# Version compare: true if $1 is newer than $2 (numeric x.y.z)
+version_gt() {
+    local IFS=. i a=() b=()
+    read -r -a a <<<"${1%%[^0-9.]*}"; read -r -a b <<<"${2%%[^0-9.]*}"
+    for i in 0 1 2; do
+        [ "$((10#${a[i]:-0}))" -gt "$((10#${b[i]:-0}))" ] && return 0
+        [ "$((10#${a[i]:-0}))" -lt "$((10#${b[i]:-0}))" ] && return 1
+    done
+    return 1
+}
+
+# Newest published release of this script on GitHub (tag name), empty if none.
+# Drafts are not visible without a token; tags with a suffix (e.g. -rc1) are ignored.
+latest_release_tag() {
+    local json tag best="" bestv="0.0.0" v
+    json="$(mktemp)"
+    download "$REPO_API/releases?per_page=100" "$json" || { rm -f "$json"; return 1; }
+    while read -r tag; do
+        v="${tag#"$TAG_PREFIX"}"
+        [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        version_gt "$v" "$bestv" && { best="$tag"; bestv="$v"; }
+    done < <(grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' "$json" | sed -E 's/.*"([^"]+)"$/\1/' | grep "^$TAG_PREFIX")
+    rm -f "$json"
+    echo "$best"
+}
+
+# Turn REF into something we can download from. Prints the git ref; returns 1 on failure.
+resolve_ref() {
+    local ref; ref="$(normalize_ref "$1")"
+    if [ "$ref" == "latest" ]; then
+        ref="$(latest_release_tag)" || { warn "could not ask GitHub for releases"; return 1; }
+        if [ -z "$ref" ]; then
+            warn "no release of $MARKER on GitHub yet - using the main branch"
+            ref="main"
+        fi
+    fi
+    echo "$ref"
+}
+
+script_version() { sed -nE 's/^VERSION="([^"]+)".*/\1/p' "$1" | head -n1; }
 
 # Check that a file is a sane copy of this script
 valid_script() {
@@ -438,6 +497,7 @@ cmd_install() {
         fi
     fi
 
+    REF="$(normalize_ref "$REF")"
     [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || die "invalid --ref '$REF'"
     local mins; mins="$(interval_minutes "$INTERVAL")"
     [[ "$mins" =~ ^[0-9]+$ ]] && [ "$mins" -ge 5 ] && [ "$mins" -le 1440 ] \
@@ -477,8 +537,9 @@ cmd_install() {
         fi
     else
         # Running from a pipe (wget -qO- ... | sudo bash -s install): fetch a copy
+        local gitref; gitref="$(resolve_ref "$REF")" || die "could not find what to download for --ref $REF"
         src="$(mktemp)"
-        download "$REPO_RAW/$REF/$MARKER/$MARKER.sh" "$src" || { rm -f "$src"; die "download failed (needs wget or curl)"; }
+        download "$REPO_RAW/$gitref/$MARKER/$MARKER.sh" "$src" || { rm -f "$src"; die "download of $gitref failed (needs wget or curl)"; }
         valid_script "$src" || { rm -f "$src"; die "downloaded file is not a valid $MARKER script"; }
         put_script "$src" || { rm -f "$src"; die "could not write $SCRIPT_PATH"; }
         rm -f "$src"
@@ -519,25 +580,64 @@ cmd_install() {
     exit 0
 }
 
+# update [--check] [--force] [--quiet]
+#   Asks GitHub which version is available for the configured --ref and installs it
+#   only if it is newer than the installed one (--force: also same/older version).
 cmd_update() {
-    local quiet="" new
-    [ "${1:-}" == "--quiet" ] && quiet=1
+    local quiet="" check="" force="" new gitref newver
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --quiet) quiet=1 ;;
+            --check) check=1 ;;
+            --force) force=1 ;;
+            *) die "unknown update option: $1 (use --check, --force or --quiet)" ;;
+        esac
+        shift
+    done
     load_conf
+    gitref="$(resolve_ref "$REF")" || { log_event ERROR "update: could not reach GitHub"; die "could not reach GitHub"; }
+
     new="$(mktemp)"
-    if ! download "$REPO_RAW/$REF/$MARKER/$MARKER.sh" "$new"; then
-        rm -f "$new"; log_event ERROR "update failed: download from $REF failed"; die "download failed"
+    if ! download "$REPO_RAW/$gitref/$MARKER/$MARKER.sh" "$new"; then
+        rm -f "$new"; log_event ERROR "update failed: download of $gitref failed"; die "download of $gitref failed"
     fi
     if ! valid_script "$new"; then
-        rm -f "$new"; log_event ERROR "update refused: downloaded file from $REF is not valid"; die "downloaded file is not a valid $MARKER script - keeping the current one"
+        rm -f "$new"; log_event ERROR "update refused: file from $gitref is not valid"
+        die "downloaded file is not a valid $MARKER script - keeping the current one"
     fi
-    if cmp -s "$new" "$SCRIPT_PATH"; then
-        rm -f "$new"; [ -n "$quiet" ] || info "Already up to date ($VERSION)"; exit 0
+    newver="$(script_version "$new")"
+
+    if [ -n "$check" ]; then
+        rm -f "$new"
+        echo "Installed: $VERSION"
+        echo "GitHub:    ${newver:-?} ($gitref, from --ref $REF)"
+        if version_gt "$newver" "$VERSION"; then
+            echo "An update is available: sudo $MARKER update"
+            exit 10
+        fi
+        if [ "$newver" == "$VERSION" ]; then echo "Up to date."
+        else echo "The installed version is newer than the one on GitHub."
+        fi
+        exit 0
     fi
-    local newver; newver="$(sed -nE 's/^VERSION="([^"]+)".*/\1/p' "$new" | head -n1)"
+
+    if ! version_gt "$newver" "$VERSION" && [ -z "$force" ]; then
+        rm -f "$new"
+        if [ "$newver" == "$VERSION" ]; then
+            [ -n "$quiet" ] || info "Already up to date ($VERSION, $gitref)"
+        else
+            [ -n "$quiet" ] || info "GitHub has $newver ($gitref), installed is $VERSION - not downgrading (use --force)"
+        fi
+        exit 0
+    fi
+    if [ -n "$force" ] && cmp -s "$new" "$SCRIPT_PATH"; then
+        rm -f "$new"; [ -n "$quiet" ] || info "Installed file is identical to $gitref"; exit 0
+    fi
+
     put_script "$new" || { rm -f "$new"; die "could not write $SCRIPT_PATH"; }
     rm -f "$new"
-    log_event UPDATED "$VERSION -> ${newver:-?} from $REF"
-    info "Updated $VERSION -> ${newver:-?}"
+    log_event UPDATED "$VERSION -> ${newver:-?} ($gitref)"
+    info "Updated $VERSION -> ${newver:-?} ($gitref)"
     # Rewrite the schedule with the new version, in case the unit layout changed
     "$SCRIPT_PATH" install >/dev/null || warn "re-running install after update failed"
     exit 0
@@ -731,6 +831,7 @@ cmd_status() {
 case "${1:-}" in
     install)   need_root "$@"; shift; cmd_install "$@" ;;
     update)    need_root "$@"; shift; cmd_update "$@" ;;
+    check)     shift; cmd_update --check "$@" ;;
     uninstall) need_root "$@"; shift; cmd_uninstall "$@" ;;
     status)    shift; cmd_status "$@" ;;
     report)    need_root "$@"; shift; cmd_report "$@" ;;
@@ -747,11 +848,11 @@ fi
 usage() {
     echo "Usage: $(basename "$0") [IP-ADDRESS] [yes/no] [dryrun]"
     echo "       $(basename "$0") <ZONE> [ZONE...] [yes/no] [dryrun] [force]"
-    echo "       $(basename "$0") install [--interval 1h] [--keep-files] [--auto-update] [--ref main]"
+    echo "       $(basename "$0") install [--interval 1h] [--keep-files] [--auto-update] [--ref main|latest|v1.0.0]"
     echo "               [--report-email a@b.se] [--report-time 07:00] [--report-always]"
     echo "               [--smtp smtps://host:465 --smtp-user user] [--mail-from addr]"
     echo "       $(basename "$0") report [--test|--print|--always]"
-    echo "       $(basename "$0") update | status | uninstall | version"
+    echo "       $(basename "$0") check | update [--force] | status | uninstall | version"
     exit 1
 }
 

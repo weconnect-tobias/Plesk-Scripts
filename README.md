@@ -39,6 +39,38 @@ sudo curl -fsSL https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts
   -o /usr/local/sbin/SCRIPT
 ```
 
+## Releases
+
+Releases are optional. Scripts with an `update` command compare the `VERSION` in the script on `main` with the installed one, so raising `VERSION` and pushing is enough to roll out a change.
+
+If you do want GitHub releases, each script has its own versions and releases. Tags are named after the script:
+
+```
+plesk-slave-zone-cleanup-v1.0.0
+plesk-triage-v1.2.0
+```
+
+A release contains only the notes and the file of that script. GitHub always adds a source zip of the whole repo, but that can be ignored. Scripts with their own `update` command (such as `plesk-slave-zone-cleanup`) look for the newest release with their own prefix and ignore the rest.
+
+To make a release:
+
+1. Raise `VERSION="x.y.z"` in the script, commit and push to `main`
+2. On GitHub: **Releases → Draft a new release**
+3. **Choose a tag** → type `<script>-vX.Y.Z` → **Create new tag on publish**, target `main`
+4. Title: `<script> vX.Y.Z`. Write what changed.
+5. Drag the script file into **Attach binaries**
+6. **Publish release**
+
+Or with the GitHub CLI:
+
+```bash
+gh release create plesk-slave-zone-cleanup-v1.0.0 --target main \
+  --title "plesk-slave-zone-cleanup v1.0.0" --notes-file notes.md \
+  plesk-slave-zone-cleanup/plesk-slave-zone-cleanup.sh
+```
+
+The tag must match `VERSION` in the script. Otherwise `update` sees the wrong version.
+
 ## Principles
 
 All scripts in this repo follow the same rules:

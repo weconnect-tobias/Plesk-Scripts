@@ -91,7 +91,9 @@ sudo plesk-slave-zone-cleanup install --interval 30min    # how often (5min-24h,
 sudo plesk-slave-zone-cleanup install --keep-files        # remove zones but keep zone files
 sudo plesk-slave-zone-cleanup install --delete-files      # remove zones and zone files (default)
 sudo plesk-slave-zone-cleanup install --auto-update       # update itself daily at ~04:00
-sudo plesk-slave-zone-cleanup install --ref v1.0.0        # branch or tag to install and update from
+sudo plesk-slave-zone-cleanup install --ref main          # follow VERSION on the main branch (default)
+sudo plesk-slave-zone-cleanup install --ref latest        # follow GitHub releases instead
+sudo plesk-slave-zone-cleanup install --ref v1.0.0        # stay on one release
 ```
 
 Run `install` again at any time to change a setting. Settings you don't mention are kept.
@@ -151,19 +153,31 @@ Every event is also written to `/var/log/plesk-slave-zone-cleanup.log`. `status`
 
 ### Updates
 
+The script has its version at the top: `VERSION="1.0.0"`. `check` and `update` download the script from GitHub, read its `VERSION` and compare it with the installed one. Only a higher version is installed:
+
 ```bash
-sudo plesk-slave-zone-cleanup update
+plesk-slave-zone-cleanup check          # installed version vs. GitHub (exit code 10 = update available)
+sudo plesk-slave-zone-cleanup update    # install it if it is newer
 ```
 
-This downloads the script from the configured `--ref` and checks that it really is this script (shebang, name, `bash -n`). Only then does it replace the installed copy. A failed download or a broken file leaves the current version in place.
+To roll out a change: raise `VERSION` in the script and push to `main`. Servers with `--auto-update` pick it up the next night (around 04:00), and the others when you run `update`. A push that doesn't raise `VERSION` is not rolled out, so work in progress stays on GitHub.
 
-With `--auto-update` this runs every day. **Think before turning it on:** everything that lands in the branch then runs as root on all your nameservers within a day, and this script deletes zones. The safer setup is to tag releases and install from a tag (`--ref v1.0.0`). Your servers then only change when you run `install --ref <new tag>`.
+Before replacing anything, `update` checks that the downloaded file really is this script (shebang, name, `bash -n`). A failed download or a broken file leaves the current version in place. It never downgrades unless you add `--force`.
+
+GitHub releases work too, if you want them (see [Releases](../README.md#releases)):
+
+| `--ref` | Looks at |
+|---|---|
+| `main` (default) | `VERSION` in the script on the main branch |
+| `latest` | The newest published release of this script (tag `plesk-slave-zone-cleanup-vX.Y.Z`). Releases of other scripts are ignored. |
+| `v1.0.0` | Only that release. Nothing changes until you pick another version with `install --ref`. |
 
 ### Status and removal
 
 ```bash
 plesk-slave-zone-cleanup status          # settings, next run, last runs
 plesk-slave-zone-cleanup version
+plesk-slave-zone-cleanup check
 sudo plesk-slave-zone-cleanup uninstall  # removes schedule, settings and script; BIND is untouched
 ```
 
