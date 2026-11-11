@@ -28,10 +28,28 @@
 #
 # Options can be given in any order after the IP/zones.
 #
-# Run as a regular sudo user (e.g. ubuntu), not as root.
+# Non-interactive: when there is no terminal (cron, ssh host cmd, pipes) the script never
+# asks anything. If yes/no is not given, zone files are deleted (yes). The "primary may be
+# down" safety check aborts instead of asking. Every removal is logged to syslog with the
+# tag plesk-slave-zone-cleanup.
+#
+# Exit codes: 0 = OK (or nothing to do), 1 = error or a removal failed, 2 = aborted by safety check.
+#
+# Run as a regular sudo user (e.g. ubuntu); running as root also works.
 # MIT license.
 
 set -uo pipefail
+
+# Run a command as root: directly if we already are root, otherwise via sudo
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -- "$@"; fi
+}
+
+# True when someone can answer questions
+interactive() { [ -t 0 ] && [ -t 1 ]; }
+
+TAG="plesk-slave-zone-cleanup"
+log_sys() { logger -t "$TAG" -- "$*" 2>/dev/null || true; }
 
 usage() {
     echo "Usage: $(basename "$0") <IP-ADDRESS> [yes/no] [dryrun]"
@@ -83,6 +101,9 @@ if [[ "$DELETE_FILES" == "yes" || "$DELETE_FILES" == "y" ]]; then
     DELETE_FLAG="-clean"
 elif [[ "$DELETE_FILES" == "no" || "$DELETE_FILES" == "n" ]]; then
     DELETE_FLAG=""
+elif [ -n "$DRYRUN" ] || ! interactive; then
+    # Dry run or no terminal: don't ask, use the default
+    DELETE_FLAG="-clean"
 else
     read -r -p "Do you want to delete the zone files as well? (yes/no) [default: yes]: " DELETE_FILES
     DELETE_FILES="${DELETE_FILES,,}"
@@ -94,7 +115,7 @@ else
 fi
 
 for cmd in rndc dig; do
-    if ! command -v "$cmd" >/dev/null 2>&1 && ! sudo sh -c "command -v $cmd" >/dev/null 2>&1; then
+    if ! command -v "$cmd" >/dev/null 2>&1 && ! as_root sh -c "command -v $cmd" >/dev/null 2>&1; then
         echo "Error: '$cmd' not found (dig is in the bind9-dnsutils / dnsutils package)."
         exit 1
     fi
@@ -106,7 +127,7 @@ read_log() {
     local f
     for f in "$LOGFILE.1" "$LOGFILE"; do
         if [ -r "$f" ]; then cat "$f"
-        elif sudo test -f "$f"; then sudo cat "$f"
+        elif as_root test -f "$f"; then as_root cat "$f"
         fi
     done
 }
@@ -127,22 +148,23 @@ extract_zones() {
 declare -A REASON=()     # zone -> RETRY / DISABLED / MANUAL
 declare -A PRIMARY=()    # zone -> primary IP to check against
 
-# Read the first primary IP from 'rndc showzone' (works for zones added with rndc addzone,
-# which is how Plesk Slave DNS Manager adds them)
-primary_from_showzone() {
-    sudo rndc showzone "$1" 2>/dev/null \
+# Read ALL primary IPs of a zone from 'rndc showzone', space separated (works for zones
+# added with rndc addzone, which is how Plesk Slave DNS Manager adds them).
+# The zone's current config is the truth - log lines can be old or refer to another server.
+primaries_from_showzone() {
+    as_root rndc showzone "$1" 2>/dev/null \
         | grep -oE '(primaries|masters)[^{]*\{[^}]*\}' \
+        | sed -E 's/^[^{]*\{//; s/port [0-9]+//g' \
         | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]*:[0-9a-fA-F:]+' \
-        | head -n1
+        | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 
 if [ ${#MANUAL_ZONES[@]} -gt 0 ]; then
     for z in "${MANUAL_ZONES[@]}"; do
         REASON["$z"]="MANUAL"
-        PRIMARY["$z"]="$(primary_from_showzone "$z")"
     done
 else
-    if ! sudo test -f "$LOGFILE"; then
+    if ! as_root test -f "$LOGFILE"; then
         echo "Error: Log file $LOGFILE does not exist!"
         exit 1
     fi
@@ -155,10 +177,10 @@ else
 
     # Validate domain names and merge (a zone may appear in both lists)
     for z in "${RETRY_ZONES[@]}"; do
-        is_domain "$z" && { REASON["$z"]="RETRY"; PRIMARY["$z"]="$TARGET_IP"; }
+        is_domain "$z" && REASON["$z"]="RETRY"
     done
     for z in "${DISABLED_ZONES[@]}"; do
-        is_domain "$z" && { REASON["$z"]="DISABLED"; PRIMARY["$z"]="$TARGET_IP"; }
+        is_domain "$z" && REASON["$z"]="DISABLED"
     done
 
     if [ ${#REASON[@]} -eq 0 ]; then
@@ -189,9 +211,36 @@ check_primary() {
     esac
 }
 
+# Check a zone against ALL its primaries and combine the answers:
+#   ACTIVE   = at least one primary serves the zone -> it is alive somewhere, leave it
+#   GONE     = every primary says it doesn't have the zone
+#   TIMEOUT  = no primary answers
+#   MIXED    = some say GONE, some don't answer -> can't be sure, leave it
+#   OTHER(x) = an unexpected answer from at least one primary -> leave it
+#   UNKNOWN  = no primary known
+check_all_primaries() {
+    local zone="$1" ip res gone=0 timeout=0 other=""
+    shift
+    [ $# -eq 0 ] && { echo "UNKNOWN"; return; }
+    for ip in "$@"; do
+        res="$(check_primary "$zone" "$ip")"
+        case "$res" in
+            ACTIVE)  echo "ACTIVE"; return ;;
+            GONE)    gone=$((gone + 1)) ;;
+            TIMEOUT) timeout=$((timeout + 1)) ;;
+            *)       other="$res" ;;
+        esac
+    done
+    if [ -n "$other" ]; then echo "$other"
+    elif [ "$timeout" -eq 0 ]; then echo "GONE"
+    elif [ "$gone" -eq 0 ]; then echo "TIMEOUT"
+    else echo "MIXED"
+    fi
+}
+
 # Does the zone still exist on this slave?
 zone_exists_locally() {
-    sudo rndc zonestatus "$1" >/dev/null 2>&1
+    as_root rndc zonestatus "$1" >/dev/null 2>&1
 }
 
 TO_REMOVE=()
@@ -206,24 +255,40 @@ for ZONE in $(printf '%s\n' "${!REASON[@]}" | sort); do
         printf "%-40s %-9s %-10s %s\n" "$ZONE" "$why" "-" "skip (no longer exists locally)"
         continue
     fi
-    live="$(check_primary "$ZONE" "${PRIMARY[$ZONE]}")"
+    # The zone's configured primaries decide, not the log
+    PRIMARY["$ZONE"]="$(primaries_from_showzone "$ZONE")"
+    if [ -n "$TARGET_IP" ]; then
+        if [ -z "${PRIMARY[$ZONE]}" ]; then
+            PRIMARY["$ZONE"]="$TARGET_IP"   # config not readable: fall back to the log's primary
+        elif [[ " ${PRIMARY[$ZONE]} " != *" $TARGET_IP "* ]]; then
+            printf "%-40s %-9s %-10s %s\n" "$ZONE" "$why" "-" "skip (zone now uses primary ${PRIMARY[$ZONE]}, not $TARGET_IP)"
+            SKIPPED+=("$ZONE")
+            continue
+        fi
+    fi
+    # shellcheck disable=SC2086  # word-split the space separated primaries on purpose
+    live="$(check_all_primaries "$ZONE" ${PRIMARY[$ZONE]})"
     action="REMOVE"
     case "$live" in
         ACTIVE)
             if [ "$why" == "MANUAL" ] && [ -n "$FORCE" ]; then
                 action="REMOVE"
             elif [ "$why" == "MANUAL" ]; then
-                action="skip (still served by primary ${PRIMARY[$ZONE]}, add 'force')"
+                action="skip (still served by a primary: ${PRIMARY[$ZONE]}, add 'force')"
             else
                 action="skip (active on primary again)"
             fi ;;
+        MIXED)
+            action="skip (some primaries say gone, others don't answer)" ;;
         UNKNOWN)
             # Zone given by name but primary could not be read - the user asked explicitly
             action="REMOVE" ;;
         TIMEOUT)
             # A timeout is only enough for RETRY zones (original behaviour).
-            # A DISABLED zone that suddenly times out suggests a network problem.
-            [ "$why" == "DISABLED" ] && action="skip (primary not answering right now)" ;;
+            # A DISABLED or named zone that suddenly times out suggests a network problem.
+            if [ "$why" == "DISABLED" ] || { [ "$why" == "MANUAL" ] && [ -z "$FORCE" ]; }; then
+                action="skip (primary not answering right now)"
+            fi ;;
         OTHER*)
             if [ "$why" == "MANUAL" ] && [ -n "$FORCE" ]; then
                 action="REMOVE"
@@ -249,30 +314,85 @@ for ZONE in "${TO_REMOVE[@]}"; do
 done
 if [ "$TIMEOUT_COUNT" -ge 10 ] && [ "$TIMEOUT_COUNT" -eq ${#TO_REMOVE[@]} ] && [[ "$DRYRUN" != "dryrun" ]]; then
     echo "WARNING: $TIMEOUT_COUNT zones where the primary does not answer at all. Is $TARGET_IP down?"
+    if ! interactive; then
+        echo "Aborting (non-interactive). Run it by hand to confirm."
+        log_sys "aborted: $TIMEOUT_COUNT zones with primary $TARGET_IP timing out - primary may be down"
+        exit 2
+    fi
     read -r -p "Type 'YES' to remove them anyway: " confirm
-    [ "$confirm" == "YES" ] || { echo "Aborting."; exit 1; }
+    [ "$confirm" == "YES" ] || { echo "Aborting."; exit 2; }
 fi
 
 if [[ "$DRYRUN" == "dryrun" ]]; then
     echo "DRY-RUN MODE ENABLED! No changes will be made."
     for ZONE in "${TO_REMOVE[@]}"; do
-        echo "[DRY-RUN] Would run: sudo rndc delzone $DELETE_FLAG $ZONE"
+        echo "[DRY-RUN] Would run: rndc delzone $DELETE_FLAG $ZONE"
     done
     echo "Dry-run complete. ${#TO_REMOVE[@]} zone(s) would be removed, ${#SKIPPED[@]} skipped."
     exit 0
 fi
 
+# Zone file paths for a zone (zone file + journal), as absolute paths
+BIND_DIR=""
+bind_directory() {
+    if [ -z "$BIND_DIR" ]; then
+        BIND_DIR="$(as_root named-checkconf -p 2>/dev/null | sed -nE 's/^[[:space:]]*directory[[:space:]]+"([^"]+)".*/\1/p' | head -n1)"
+        [ -z "$BIND_DIR" ] && BIND_DIR="/var/cache/bind"
+    fi
+    echo "$BIND_DIR"
+}
+zone_files() {
+    local f
+    f="$(as_root rndc showzone "$1" 2>/dev/null | sed -nE 's/.*[[:space:]]file[[:space:]]+"([^"]+)".*/\1/p' | head -n1)"
+    [ -z "$f" ] && return
+    [[ "$f" != /* ]] && f="$(bind_directory)/$f"
+    echo "$f"
+    echo "$f.jnl"
+}
+
 REMOVED=0
 FAILED=0
 for ZONE in "${TO_REMOVE[@]}"; do
     echo "Removing zone: $ZONE (${REASON[$ZONE]}) with rndc delzone $DELETE_FLAG"
+    mapfile -t FILES < <(zone_files "$ZONE")
+
     # shellcheck disable=SC2086  # DELETE_FLAG is either empty or -clean
-    if sudo rndc delzone $DELETE_FLAG "$ZONE"; then
-        REMOVED=$((REMOVED + 1))
-    else
+    if ! as_root rndc delzone $DELETE_FLAG "$ZONE"; then
+        echo "  ERROR: rndc delzone failed for $ZONE"
+        log_sys "FAILED to remove zone $ZONE (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
         FAILED=$((FAILED + 1))
+        continue
     fi
+
+    # Verify the zone is gone from BIND (delzone can take a moment)
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        zone_exists_locally "$ZONE" || break
+        sleep 0.5
+    done
+    if zone_exists_locally "$ZONE"; then
+        echo "  ERROR: $ZONE is still loaded in BIND"
+        log_sys "FAILED: zone $ZONE still loaded after rndc delzone"
+        FAILED=$((FAILED + 1))
+        continue
+    fi
+
+    # With -clean BIND deletes the files when the zone is unloaded. Make sure they are gone.
+    if [ -n "$DELETE_FLAG" ]; then
+        for f in "${FILES[@]}"; do
+            for _ in 1 2 3 4 5 6; do as_root test -e "$f" || break; sleep 0.5; done
+            if as_root test -e "$f"; then
+                as_root rm -f -- "$f" && echo "  Deleted leftover file $f"
+            fi
+        done
+        echo "  OK: zone removed and zone files deleted"
+        log_sys "removed zone $ZONE and its files (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
+    else
+        echo "  OK: zone removed, zone files kept${FILES[0]:+ (${FILES[0]})}"
+        log_sys "removed zone $ZONE, files kept (${REASON[$ZONE]}, primary ${PRIMARY[$ZONE]:-unknown})"
+    fi
+    REMOVED=$((REMOVED + 1))
 done
 
 # rndc delzone takes effect immediately; no rndc reload needed.
 echo "Cleanup completed! Removed: $REMOVED, failed: $FAILED, skipped: ${#SKIPPED[@]}."
+[ "$FAILED" -eq 0 ]
