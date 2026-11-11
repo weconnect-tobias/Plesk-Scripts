@@ -17,20 +17,27 @@ Small, standalone scripts for running and troubleshooting Plesk servers. Each sc
 Every script installs the same way. Replace `SCRIPT` with the script name from the table above:
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/SCRIPT/SCRIPT.sh \
-  -o /usr/local/sbin/SCRIPT
+sudo wget -qO /usr/local/sbin/SCRIPT \
+  https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/SCRIPT/SCRIPT.sh
 sudo chmod 755 /usr/local/sbin/SCRIPT
 ```
 
 Example:
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-triage/plesk-triage.sh \
-  -o /usr/local/sbin/plesk-triage
+sudo wget -qO /usr/local/sbin/plesk-triage \
+  https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-triage/plesk-triage.sh
 sudo chmod 755 /usr/local/sbin/plesk-triage
 ```
 
 Run the same command again to update. Read a script before you install it; they run with sudo.
+
+`wget` is present on most minimal installs. If it is missing, install it with `sudo apt-get install -y wget`, or use `curl` instead:
+
+```bash
+sudo curl -fsSL https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/SCRIPT/SCRIPT.sh \
+  -o /usr/local/sbin/SCRIPT
+```
 
 ## Principles
 

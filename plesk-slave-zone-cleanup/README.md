@@ -25,14 +25,25 @@ Both `primary` (BIND 9.18+) and `master` (older BIND) are matched.
 
 ## Safety checks
 
-Log lines can be old, so every zone is checked live against the primary with `dig +norec SOA` before anything is removed:
+Log lines can be old, and the same domain can exist on more than one Plesk server. So before anything is removed, the script reads the zone's **current** primaries from `rndc showzone` and checks **every** one of them live with `dig +norec SOA`:
 
-| Primary answer | Action |
+| Primary answers | Action |
 |---|---|
-| Authoritative answer (`aa` flag) | Skip: the zone is active again |
-| `REFUSED`, `NOTAUTH`, `NXDOMAIN`, or no `aa` flag | Remove |
-| Timeout | Remove RETRY zones (the original behaviour); skip DISABLED zones, since a sudden timeout suggests a network problem |
-| Anything else (e.g. `SERVFAIL`) | Skip: the zone exists on the primary but is broken there, check manually |
+| At least one primary answers authoritatively (`aa` flag) | Skip: the zone is active somewhere |
+| All primaries answer `REFUSED`, `NOTAUTH`, `NXDOMAIN`, or without the `aa` flag | Remove |
+| No primary answers (timeout) | Remove RETRY zones (the original behaviour); skip DISABLED and named zones, since a sudden timeout suggests a network problem (`force` overrides for named zones) |
+| Some say gone, others time out (`MIXED`) | Skip: can't be sure |
+| Anything else (e.g. `SERVFAIL`) | Skip: the zone exists on a primary but is broken there, check manually |
+
+In log mode, a zone whose primaries no longer include the IP you gave is skipped. That happens when the domain has been moved to another Plesk server and the zone was re-added from there; the old log lines then refer to the wrong server.
+
+### The same domain on two Plesk servers
+
+Say `example.com` is active on Plesk server A and switched off (or left over) on server B:
+
+- **The secondary's zone points to A:** A answers authoritatively, so the zone is kept, whether you run the script for B's IP or name the zone.
+- **The secondary's zone points to B:** B says it doesn't have the zone, so the zone is removed. That is correct, since it was stale, but A's zone is not on the secondary until A pushes it again. Use *Resync* in Slave DNS Manager on server A, or switch DNS off and on for the domain there.
+- **The zone lists both A and B as primaries:** A answers, so the zone is kept.
 
 Zones that no longer exist on the secondary are skipped, so the script can be run again safely.
 
@@ -42,15 +53,17 @@ If 10 or more zones would be removed only because the primary times out, the scr
 
 - BIND 9 secondary with `rndc` access and `allow-new-zones yes` (as set up by Plesk Slave DNS Manager)
 - `dig` (package `bind9-dnsutils` or `dnsutils`)
-- A user with sudo. The script doesn't need to be run as root; it uses `sudo` for `rndc` and for reading the log.
+- A user with sudo. The script doesn't need to be run as root; it uses `sudo` for `rndc` and for reading the log. Running as root also works.
 
 ## Installation
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-slave-zone-cleanup/plesk-slave-zone-cleanup.sh \
-  -o /usr/local/sbin/plesk-slave-zone-cleanup
+sudo wget -qO /usr/local/sbin/plesk-slave-zone-cleanup \
+  https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-slave-zone-cleanup/plesk-slave-zone-cleanup.sh
 sudo chmod 755 /usr/local/sbin/plesk-slave-zone-cleanup
 ```
+
+If `wget` is missing: `sudo apt-get install -y wget`, or see [Installing a script](../README.md#installing-a-script) for the `curl` variant.
 
 ## Usage
 
@@ -68,7 +81,7 @@ plesk-slave-zone-cleanup example.com yes force    # remove even if the primary s
 
 | Option | Meaning |
 |---|---|
-| `yes` / `no` | Also delete the zone file (`rndc delzone -clean`). If left out, the script asks (default: yes). |
+| `yes` / `no` | Also delete the zone file (`rndc delzone -clean`). If left out, the script asks (default: yes); without a terminal or with `dryrun` it uses yes without asking. |
 | `dryrun` | Only show what would be done. |
 | `force` | Zone mode only: remove the zone even if the primary still answers for it, e.g. when the domain is moving to another DNS. |
 
@@ -76,11 +89,38 @@ Options can be given in any order after the IP address or zone names. You can't 
 
 In zone mode the primary is read from `rndc showzone <zone>`. If it can't be read, the zone is removed without a live check, since you named it explicitly.
 
+After each removal the script checks that the zone is really gone from BIND. With `yes` it also checks that the zone file and its `.jnl` journal are gone, and deletes any file BIND left behind.
+
 To read a different log file:
 
 ```bash
 LOGFILE=/var/log/named/named.log plesk-slave-zone-cleanup 192.0.2.10 dryrun
 ```
+
+## Running automatically
+
+The script never asks anything when there is no terminal (cron, `ssh host command`, pipes):
+
+- If `yes`/`no` is not given, zone files are deleted.
+- The "primary may be down" check (10+ zones that only time out) aborts with exit code 2 instead of asking.
+- Every removal and failure is logged to syslog with the tag `plesk-slave-zone-cleanup`:
+  `sudo grep plesk-slave-zone-cleanup /var/log/syslog`
+
+From your workstation, against every secondary:
+
+```bash
+for ns in ns1.example.com ns2.example.com ns3.example.com; do
+  echo "== $ns"; ssh "$ns" plesk-slave-zone-cleanup example.com yes
+done
+```
+
+Nightly from cron on each secondary (`sudo crontab -e`):
+
+```cron
+30 3 * * * /usr/local/sbin/plesk-slave-zone-cleanup 192.0.2.10 yes >/dev/null 2>&1
+```
+
+Exit codes: 0 = OK or nothing to do, 1 = error or a removal failed, 2 = aborted by the safety check.
 
 ## Reading the output
 
