@@ -10,6 +10,7 @@ Small, standalone scripts for running and troubleshooting Plesk servers. Each sc
 | [plesk-compromise-check](plesk-compromise-check/) | Looks for signs of a break-in: webshells, PHP in upload folders, prepend backdoors, shells spawned by PHP, malware in temp folders, rogue accounts and WordPress admins, modified core files. Read-only. |
 | [plesk-wp-integrity](plesk-wp-integrity/) | Checks every WordPress installation's core and wordpress.org plugins against official checksums via WP Toolkit, flags suspicious code, and can repair them. Check only by default; `--fix` asks first and saves everything for `--restore`. |
 | [plesk-cron-cleanup](plesk-cron-cleanup/) | Finds orphaned and wrong-owner crontabs left behind by deleted subscriptions, and moves them aside safely. Dry run by default. |
+| [plesk-slave-zone-cleanup](plesk-slave-zone-cleanup/) | Runs on BIND secondary nameservers. Finds slave zones the Plesk primary no longer serves (deleted domains, DNS switched off) from the log or by name, checks each one live against the primary, and removes them with `rndc delzone`. `dryrun` shows what would happen. |
 
 ## Installing a script
 
