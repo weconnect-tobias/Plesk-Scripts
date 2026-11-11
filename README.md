@@ -1,6 +1,6 @@
 # Plesk-Scripts
 
-Small, standalone scripts for running and troubleshooting Plesk servers. Each script lives in its own folder with its own README, and can be installed with a single command.
+Small, standalone scripts for running and troubleshooting Plesk servers and the nameservers around them. Each script lives in its own folder with its own README, and can be installed with a single command.
 
 ## Scripts
 
@@ -10,7 +10,7 @@ Small, standalone scripts for running and troubleshooting Plesk servers. Each sc
 | [plesk-compromise-check](plesk-compromise-check/) | Looks for signs of a break-in: webshells, PHP in upload folders, prepend backdoors, shells spawned by PHP, malware in temp folders, rogue accounts and WordPress admins, modified core files. Read-only. |
 | [plesk-wp-integrity](plesk-wp-integrity/) | Checks every WordPress installation's core and wordpress.org plugins against official checksums via WP Toolkit, flags suspicious code, and can repair them. Check only by default; `--fix` asks first and saves everything for `--restore`. |
 | [plesk-cron-cleanup](plesk-cron-cleanup/) | Finds orphaned and wrong-owner crontabs left behind by deleted subscriptions, and moves them aside safely. Dry run by default. |
-| [plesk-slave-zone-cleanup](plesk-slave-zone-cleanup/) | Runs on BIND secondary nameservers. Finds slave zones the Plesk primaries no longer serve (deleted domains, DNS switched off) from the log or by name, checks each one live against the primary, and removes them with `rndc delzone`. `dryrun` shows what would happen. Has its own `install` that sets up packages, a systemd timer or cron job, and an optional daily mail report. |
+| [dns-zone-cleanup](dns-zone-cleanup/) | Runs on BIND secondary nameservers, with any primary (Plesk or not) and old BIND versions too. Removes stale secondary zones: zones the primary no longer serves (from the log, checked live against every primary) and domains no longer delegated to the server (after 7 days). Handles `rndc addzone` zones and zones in `named.conf`. Has its own `install` with a systemd timer or cron job, self-update and an optional daily mail report. Formerly `plesk-slave-zone-cleanup`. |
 
 ## Installing a script
 
@@ -46,11 +46,11 @@ Releases are optional. Scripts with an `update` command compare the `VERSION` in
 If you do want GitHub releases, each script has its own versions and releases. Tags are named after the script:
 
 ```
-plesk-slave-zone-cleanup-v1.0.0
+dns-zone-cleanup-v1.0.0
 plesk-triage-v1.2.0
 ```
 
-A release contains only the notes and the file of that script. GitHub always adds a source zip of the whole repo, but that can be ignored. Scripts with their own `update` command (such as `plesk-slave-zone-cleanup`) look for the newest release with their own prefix and ignore the rest.
+A release contains only the notes and the file of that script. GitHub always adds a source zip of the whole repo, but that can be ignored. Scripts with their own `update` command (such as `dns-zone-cleanup`) look for the newest release with their own prefix and ignore the rest.
 
 To make a release:
 
@@ -64,9 +64,9 @@ To make a release:
 Or with the GitHub CLI:
 
 ```bash
-gh release create plesk-slave-zone-cleanup-v1.0.0 --target main \
-  --title "plesk-slave-zone-cleanup v1.0.0" --notes-file notes.md \
-  plesk-slave-zone-cleanup/plesk-slave-zone-cleanup.sh
+gh release create dns-zone-cleanup-v1.0.0 --target main \
+  --title "dns-zone-cleanup v1.0.0" --notes-file notes.md \
+  dns-zone-cleanup/dns-zone-cleanup.sh
 ```
 
 The tag must match `VERSION` in the script. Otherwise `update` sees the wrong version.
