@@ -10,7 +10,7 @@ When a domain is deleted in Plesk, or DNS is switched off for it, the zone often
 plesk-slave-zone-cleanup dryrun
 ```
 
-> **This script changes things.** Without `dryrun` it removes zones from BIND, and with `yes` it also deletes the zone files. Always run with `dryrun` first. A removed zone comes back if Plesk pushes it again (e.g. when DNS is switched back on for the domain).
+> **This script changes things.** Without `dryrun` it removes zones from BIND, and by default it also deletes their zone files (choose `keep` or `archive` instead). Always run with `dryrun` first. A removed zone comes back if Plesk pushes it again (e.g. when DNS is switched back on for the domain).
 
 ## What it finds
 
@@ -51,9 +51,69 @@ If 10 or more zones of the same primary would be removed only because it times o
 
 In auto mode, zones whose primary can't be read from `rndc showzone` are skipped.
 
+## What happens to a stale zone
+
+How the zone is removed depends on how it was added:
+
+| The zone is... | What the script does |
+|---|---|
+| Added with `rndc addzone` (Plesk Slave DNS Manager) | `rndc delzone` |
+| Defined in `named.conf` or an included file (older setups, own sync scripts) | Comments out the zone statement with `# `, checks the config, reloads BIND (see below) |
+| Something that can't be done safely | Leaves it alone and reports it as **remove by hand**, in the output and in the mail report |
+
+What happens to the **zone file** is your choice (`install --delete-files`, `--keep-files` or `--archive-files`, or `delete`, `keep` or `archive` on the command line):
+
+| Setting | Zone file and `.jnl` journal |
+|---|---|
+| `delete` (default) | Deleted |
+| `keep` | Left where they are |
+| `archive` | Moved to `/var/backups/plesk-slave-zone-cleanup/<time>/zones/` |
+
+### Zones in named.conf
+
+On older nameservers the slave zones are often written straight into `named.conf` or a file it includes. Removing them from BIND isn't enough there: they come back at the next restart. So the script comments the zone statement out:
+
+```
+# [plesk-slave-zone-cleanup 2026-11-11 13:35] zone example.com removed: no primary serves it. To restore, remove the "# " in front of the lines below.
+# zone "example.com" {
+#     type slave;
+#     file "slaves/example.com";
+#     masters { 192.0.2.10; };
+# };
+```
+
+To keep this safe:
+
+1. The file is copied to `/var/backups/plesk-slave-zone-cleanup/<time>/config/` first
+2. Only zone statements that have their own lines are touched. If a zone shares a line with other config (`zone "a" {...}; zone "b" {...};`), it is reported as remove by hand.
+3. After the change, `named-checkconf` must pass. If it doesn't, **every** changed file is put back exactly as it was and the zones are reported as failed.
+4. BIND is reloaded (`rndc reconfig`, or `systemctl reload named`/`bind9` without rndc) and the script checks that the zones are gone. The zone files are only touched after that.
+
+Things to know:
+
+- **Generated config is overwritten.** If the file is written by a tool (an old Slave DNS Manager, a sync script, Ansible), that tool will put the zone back. Fix it at the source, or use `--conf-zones skip`.
+- **Comments are not removed.** Old commented-out zones stay in the file. That is on purpose, so you can see what was removed and undo it.
+- **Don't want the script to edit config files at all?** `sudo plesk-slave-zone-cleanup install --conf-zones skip`. Such zones are then only reported as remove by hand.
+
+### Old nameservers
+
+The script adapts to what the server has:
+
+| Missing | What happens instead |
+|---|---|
+| `rndc showzone` (BIND < 9.11) | The zone's primaries and file are read from `named.conf`, its includes and the `.nzf` file of `rndc addzone` |
+| `rndc zonestatus` (BIND < 9.10) | `dig @127.0.0.1` checks whether BIND still serves the zone |
+| `rndc delzone -clean` | `rndc delzone`, then the script handles the files itself |
+| A working `rndc` | Only zones in config files can be removed; BIND is reloaded via systemd/init. Zones added with `rndc addzone` are reported as remove by hand. |
+| `primaries` (BIND < 9.18 uses `masters`) | Both are understood, as are named lists (`masters plesk { 192.0.2.10; };`) |
+
+Large logs are no problem: the log is searched as a stream and only the refresh errors are kept, so memory use stays at a few MB however big `/var/log/syslog` is.
+
+If `named.conf` is somewhere else (e.g. a chroot), set `NAMED_CONF=/var/named/chroot/etc/named.conf`.
+
 ## Requirements
 
-- A BIND 9 secondary with working `rndc` and `allow-new-zones yes` (as set up by Plesk Slave DNS Manager)
+- A BIND 9 secondary. Plesk Slave DNS Manager setups (`rndc addzone`) and older setups with zones in `named.conf` both work.
 - Bash 4+, and systemd or cron
 - `dig` and `logger`. `install` adds them if they are missing.
 - A user with sudo. You don't need to log in as root; the script uses `sudo` when it needs to. Running as root also works.
@@ -88,8 +148,11 @@ plesk-slave-zone-cleanup dryrun
 
 ```bash
 sudo plesk-slave-zone-cleanup install --interval 30min    # how often (5min-24h, default 1h)
-sudo plesk-slave-zone-cleanup install --keep-files        # remove zones but keep zone files
-sudo plesk-slave-zone-cleanup install --delete-files      # remove zones and zone files (default)
+sudo plesk-slave-zone-cleanup install --delete-files      # delete zone files of removed zones (default)
+sudo plesk-slave-zone-cleanup install --keep-files        # keep them
+sudo plesk-slave-zone-cleanup install --archive-files     # move them to /var/backups/plesk-slave-zone-cleanup/
+sudo plesk-slave-zone-cleanup install --conf-zones skip   # never edit named.conf, only report such zones
+sudo plesk-slave-zone-cleanup install --conf-zones comment  # comment them out (default)
 sudo plesk-slave-zone-cleanup install --auto-update       # update itself daily at ~04:00
 sudo plesk-slave-zone-cleanup install --ref main          # follow VERSION on the main branch (default)
 sudo plesk-slave-zone-cleanup install --ref latest        # follow GitHub releases instead
@@ -100,7 +163,7 @@ Run `install` again at any time to change a setting. Settings you don't mention 
 
 ### Daily mail report
 
-Get a mail every morning when something has happened: zones removed, removals that failed, zones held back because a primary seems down, or the script updated. Nothing happened means no mail.
+Get a mail every morning when something has happened: zones removed, removals that failed, stale zones that need to be removed by hand, zones held back because a primary seems down, or the script updated. Nothing happened means no mail.
 
 With an SMTP server (no local mail server needed):
 
@@ -186,31 +249,34 @@ sudo plesk-slave-zone-cleanup uninstall  # removes schedule, settings and script
 ```bash
 # Auto mode: find broken zones from every primary in the log
 plesk-slave-zone-cleanup dryrun                   # show what would be removed
-plesk-slave-zone-cleanup                          # remove zones (asks about zone files)
-plesk-slave-zone-cleanup yes                      # remove zones and delete zone files
-plesk-slave-zone-cleanup no                       # remove zones, keep zone files
+plesk-slave-zone-cleanup                          # remove zones (asks what to do with zone files)
+plesk-slave-zone-cleanup delete                   # remove zones and delete zone files
+plesk-slave-zone-cleanup keep                     # remove zones, keep zone files
+plesk-slave-zone-cleanup archive                  # remove zones, move zone files to the backup folder
+plesk-slave-zone-cleanup dryrun verbose           # also list log zones that are already gone
 
 # Only one primary
 plesk-slave-zone-cleanup 192.0.2.10 dryrun
-plesk-slave-zone-cleanup 192.0.2.10 yes
+plesk-slave-zone-cleanup 192.0.2.10 delete
 
 # Zone mode: remove specific zones
 plesk-slave-zone-cleanup example.com dryrun
-plesk-slave-zone-cleanup example.com example.net yes
-plesk-slave-zone-cleanup example.com yes force    # remove even if the primary still serves it
+plesk-slave-zone-cleanup example.com example.net delete
+plesk-slave-zone-cleanup example.com delete force # remove even if the primary still serves it
 ```
 
 | Option | Meaning |
 |---|---|
-| `yes` / `no` | Also delete the zone file (`rndc delzone -clean`). If left out, the script asks (default: yes); without a terminal or with `dryrun` it uses yes without asking. |
-| `dryrun` | Only show what would be done. |
+| `delete` / `keep` / `archive` | What to do with the zone file (`yes` = delete, `no` = keep also work). If left out, the script asks; without a terminal or with `dryrun` it uses the installed setting (default: delete). |
+| `dryrun` | Only show what would be done, and how (`rndc delzone`, which lines are commented out where, what happens to the file). |
+| `verbose` | Also list zones from the log that are already gone. By default they are only counted. |
 | `force` | Zone mode only: remove the zone even if the primary still answers for it, e.g. when the domain is moving to another DNS. |
 
 Options can be given in any order. You can't mix an IP address and zone names in the same run.
 
-In zone mode the primary is read from `rndc showzone <zone>`. If it can't be read, the zone is removed without a live check, since you named it explicitly.
+In zone mode the primary is read from the zone's config. If it can't be read, the zone is removed without a live check, since you named it explicitly.
 
-After each removal the script checks that the zone is really gone from BIND. With `yes` it also checks that the zone file and its `.jnl` journal are gone, and deletes any file BIND left behind.
+After each removal the script checks that the zone is really gone from BIND. With `delete` it also checks that the zone file and its `.jnl` journal are gone, and deletes any file BIND left behind.
 
 To read a different log file:
 
@@ -222,7 +288,7 @@ LOGFILE=/var/log/named/named.log plesk-slave-zone-cleanup dryrun
 
 `install` sets this up for you (see above). You can also run the script from your own cron, Ansible, or over ssh. It never asks anything when there is no terminal:
 
-- If `yes`/`no` is not given, zone files are deleted.
+- If `delete`/`keep`/`archive` is not given, the installed setting is used (default: delete).
 - The "primary may be down" check (10+ zones of one primary that only time out) holds those zones back instead of asking, and the script exits with code 2.
 - Only one run at a time. A second run started while one is going exits immediately.
 - Every removal and failure is logged to `/var/log/plesk-slave-zone-cleanup.log` and to syslog with the tag `plesk-slave-zone-cleanup` (`journalctl -t plesk-slave-zone-cleanup`)
@@ -231,7 +297,7 @@ To remove a zone on every secondary from your workstation:
 
 ```bash
 for ns in ns1.example.com ns2.example.com ns3.example.com; do
-  echo "== $ns"; ssh "$ns" plesk-slave-zone-cleanup example.com yes
+  echo "== $ns"; ssh "$ns" plesk-slave-zone-cleanup example.com delete
 done
 ```
 
@@ -253,7 +319,7 @@ example.org                              RETRY     TIMEOUT    REMOVE
 
 ## Good to know
 
-- **No `rndc reload` needed.** `rndc delzone` takes effect immediately.
+- **No `rndc reload` needed** for zones added with `rndc addzone`. `rndc delzone` takes effect immediately.
 - **Run it on every secondary.** Each secondary has its own copy of the zones.
 - **Check the log format first.** If your secondaries log disabled zones with other wording, they won't be found in log mode:
   `sudo grep -E "refresh: (unexpected rcode|non-authoritative)" /var/log/syslog | head`
