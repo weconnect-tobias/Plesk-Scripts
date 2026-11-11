@@ -7,14 +7,14 @@ Run it on the **secondary nameservers** (the BIND servers that Plesk's Slave DNS
 When a domain is deleted in Plesk, or DNS is switched off for it, the zone often stays on the secondaries. BIND keeps trying to refresh it and fills the log with errors, and the secondary keeps answering for a zone that no longer exists on the primary. This script finds those zones and removes them with `rndc delzone`.
 
 ```bash
-plesk-slave-zone-cleanup 192.0.2.10 dryrun
+plesk-slave-zone-cleanup dryrun
 ```
 
 > **This script changes things.** Without `dryrun` it removes zones from BIND, and with `yes` it also deletes the zone files. Always run with `dryrun` first. A removed zone comes back if Plesk pushes it again (e.g. when DNS is switched back on for the domain).
 
 ## What it finds
 
-In log mode the script reads `/var/log/syslog` (and `syslog.1`) and looks for two kinds of zones from the given primary:
+The script reads named's log (`/var/log/syslog`, `/var/log/messages` or the systemd journal, plus the newest rotated file) and looks for two kinds of zones. By default it looks at every primary; give an IP address to only look at one:
 
 | Source | Log message | What it means |
 |---|---|---|
@@ -35,7 +35,7 @@ Log lines can be old, and the same domain can exist on more than one Plesk serve
 | Some say gone, others time out (`MIXED`) | Skip: can't be sure |
 | Anything else (e.g. `SERVFAIL`) | Skip: the zone exists on a primary but is broken there, check manually |
 
-In log mode, a zone whose primaries no longer include the IP you gave is skipped. That happens when the domain has been moved to another Plesk server and the zone was re-added from there; the old log lines then refer to the wrong server.
+When you give an IP address, a zone whose primaries no longer include that IP is skipped. That happens when the domain has been moved to another Plesk server and the zone was re-added from there; the old log lines then refer to the wrong server.
 
 ### The same domain on two Plesk servers
 
@@ -47,31 +47,85 @@ Say `example.com` is active on Plesk server A and switched off (or left over) on
 
 Zones that no longer exist on the secondary are skipped, so the script can be run again safely.
 
-If 10 or more zones would be removed only because the primary times out, the script asks you to type `YES` first. The primary may simply be down, and you don't want to wipe every zone because of that.
+If 10 or more zones of the same primary would be removed only because it times out, the script asks you to type `YES` first. Without a terminal it holds those zones back, removes the rest and exits with code 2. The primary may simply be down, and you don't want to wipe all its zones because of that. Other primaries are not affected.
+
+In auto mode, zones whose primary can't be read from `rndc showzone` are skipped.
 
 ## Requirements
 
-- BIND 9 secondary with `rndc` access and `allow-new-zones yes` (as set up by Plesk Slave DNS Manager)
-- `dig` (package `bind9-dnsutils` or `dnsutils`)
-- A user with sudo. The script doesn't need to be run as root; it uses `sudo` for `rndc` and for reading the log. Running as root also works.
+- A BIND 9 secondary with working `rndc` and `allow-new-zones yes` (as set up by Plesk Slave DNS Manager)
+- Bash 4+, and systemd or cron
+- `dig` and `logger`. `install` adds them if they are missing.
+- A user with sudo. You don't need to log in as root; the script uses `sudo` when it needs to. Running as root also works.
+
+Tested on Ubuntu. `install` also handles Debian, RHEL/AlmaLinux/Rocky/CentOS/Fedora (`dnf`/`yum`), openSUSE (`zypper`), Arch (`pacman`) and Alpine (`apk`, BusyBox cron).
 
 ## Installation
 
+One command installs the script, any missing packages and an hourly schedule:
+
 ```bash
-sudo wget -qO /usr/local/sbin/plesk-slave-zone-cleanup \
-  https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-slave-zone-cleanup/plesk-slave-zone-cleanup.sh
-sudo chmod 755 /usr/local/sbin/plesk-slave-zone-cleanup
+wget -qO- https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts/main/plesk-slave-zone-cleanup/plesk-slave-zone-cleanup.sh | sudo bash -s install
 ```
 
-If `wget` is missing: `sudo apt-get install -y wget`, or see [Installing a script](../README.md#installing-a-script) for the `curl` variant.
+If `wget` is missing, use `curl -fsSL` instead of `wget -qO-`.
+
+`install` does the following:
+
+1. Installs `dig` (`bind9-dnsutils`, `dnsutils`, `bind-utils`, `bind` or `bind-tools`, depending on the distro) and `logger` if they are missing
+2. Puts the script in `/usr/local/sbin/plesk-slave-zone-cleanup`, writing it atomically so you never get a half-written file
+3. Checks that `rndc` can talk to BIND, that `allow-new-zones` is on, and where named logs: `/var/log/syslog`, `/var/log/messages` or the systemd journal
+4. Schedules the cleanup: a systemd timer where systemd is available, otherwise `/etc/cron.d`, or `/etc/crontabs/root` on Alpine
+5. Saves the settings in `/etc/plesk-slave-zone-cleanup.conf`
+
+Then check what the first run would do:
+
+```bash
+plesk-slave-zone-cleanup dryrun
+```
+
+### Install options
+
+```bash
+sudo plesk-slave-zone-cleanup install --interval 30min    # how often (5min-24h, default 1h)
+sudo plesk-slave-zone-cleanup install --keep-files        # remove zones but keep zone files
+sudo plesk-slave-zone-cleanup install --delete-files      # remove zones and zone files (default)
+sudo plesk-slave-zone-cleanup install --auto-update       # update itself daily at ~04:00
+sudo plesk-slave-zone-cleanup install --ref v1.0.0        # branch or tag to install and update from
+```
+
+Run `install` again at any time to change a setting. Settings you don't mention are kept.
+
+### Updates
+
+```bash
+sudo plesk-slave-zone-cleanup update
+```
+
+This downloads the script from the configured `--ref` and checks that it really is this script (shebang, name, `bash -n`). Only then does it replace the installed copy. A failed download or a broken file leaves the current version in place.
+
+With `--auto-update` this runs every day. **Think before turning it on:** everything that lands in the branch then runs as root on all your nameservers within a day, and this script deletes zones. The safer setup is to tag releases and install from a tag (`--ref v1.0.0`). Your servers then only change when you run `install --ref <new tag>`.
+
+### Status and removal
+
+```bash
+plesk-slave-zone-cleanup status          # settings, next run, last runs
+plesk-slave-zone-cleanup version
+sudo plesk-slave-zone-cleanup uninstall  # removes schedule, settings and script; BIND is untouched
+```
 
 ## Usage
 
 ```bash
-# Log mode: find broken zones for a primary
-plesk-slave-zone-cleanup 192.0.2.10 dryrun        # show what would be removed
-plesk-slave-zone-cleanup 192.0.2.10 no            # remove zones, keep zone files
-plesk-slave-zone-cleanup 192.0.2.10 yes           # remove zones and delete zone files
+# Auto mode: find broken zones from every primary in the log
+plesk-slave-zone-cleanup dryrun                   # show what would be removed
+plesk-slave-zone-cleanup                          # remove zones (asks about zone files)
+plesk-slave-zone-cleanup yes                      # remove zones and delete zone files
+plesk-slave-zone-cleanup no                       # remove zones, keep zone files
+
+# Only one primary
+plesk-slave-zone-cleanup 192.0.2.10 dryrun
+plesk-slave-zone-cleanup 192.0.2.10 yes
 
 # Zone mode: remove specific zones
 plesk-slave-zone-cleanup example.com dryrun
@@ -85,7 +139,7 @@ plesk-slave-zone-cleanup example.com yes force    # remove even if the primary s
 | `dryrun` | Only show what would be done. |
 | `force` | Zone mode only: remove the zone even if the primary still answers for it, e.g. when the domain is moving to another DNS. |
 
-Options can be given in any order after the IP address or zone names. You can't mix an IP address and zone names in the same run.
+Options can be given in any order. You can't mix an IP address and zone names in the same run.
 
 In zone mode the primary is read from `rndc showzone <zone>`. If it can't be read, the zone is removed without a live check, since you named it explicitly.
 
@@ -94,19 +148,20 @@ After each removal the script checks that the zone is really gone from BIND. Wit
 To read a different log file:
 
 ```bash
-LOGFILE=/var/log/named/named.log plesk-slave-zone-cleanup 192.0.2.10 dryrun
+LOGFILE=/var/log/named/named.log plesk-slave-zone-cleanup dryrun
 ```
 
 ## Running automatically
 
-The script never asks anything when there is no terminal (cron, `ssh host command`, pipes):
+`install` sets this up for you (see above). You can also run the script from your own cron, Ansible, or over ssh. It never asks anything when there is no terminal:
 
 - If `yes`/`no` is not given, zone files are deleted.
-- The "primary may be down" check (10+ zones that only time out) aborts with exit code 2 instead of asking.
-- Every removal and failure is logged to syslog with the tag `plesk-slave-zone-cleanup`:
-  `sudo grep plesk-slave-zone-cleanup /var/log/syslog`
+- The "primary may be down" check (10+ zones of one primary that only time out) holds those zones back instead of asking, and the script exits with code 2.
+- Only one run at a time. A second run started while one is going exits immediately.
+- Every removal and failure is logged with the tag `plesk-slave-zone-cleanup`:
+  `journalctl -t plesk-slave-zone-cleanup` or `sudo grep plesk-slave-zone-cleanup /var/log/syslog`
 
-From your workstation, against every secondary:
+To remove a zone on every secondary from your workstation:
 
 ```bash
 for ns in ns1.example.com ns2.example.com ns3.example.com; do
@@ -114,13 +169,7 @@ for ns in ns1.example.com ns2.example.com ns3.example.com; do
 done
 ```
 
-Nightly from cron on each secondary (`sudo crontab -e`):
-
-```cron
-30 3 * * * /usr/local/sbin/plesk-slave-zone-cleanup 192.0.2.10 yes >/dev/null 2>&1
-```
-
-Exit codes: 0 = OK or nothing to do, 1 = error or a removal failed, 2 = aborted by the safety check.
+Exit codes: 0 = OK or nothing to do, 1 = error or a removal failed, 2 = zones held back by the safety check (see the log).
 
 ## Reading the output
 

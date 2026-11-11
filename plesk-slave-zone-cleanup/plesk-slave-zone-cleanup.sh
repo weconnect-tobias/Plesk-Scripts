@@ -28,7 +28,20 @@
 #   dryrun       Only show what would be done
 #   force        Zone mode only: remove even if the primary still serves the zone
 #
-# Options can be given in any order after the IP/zones.
+# Options can be given in any order.
+#
+# Install, schedule and update (needs sudo):
+#   plesk-slave-zone-cleanup install [--interval 1h] [--keep-files|--delete-files]
+#                                    [--auto-update|--no-auto-update] [--ref main]
+#       Installs missing packages (dig, logger) on Debian/Ubuntu, RHEL/Fedora, SUSE,
+#       Arch and Alpine, copies the script to /usr/local/sbin and schedules it with a
+#       systemd timer (or cron). Run again to change settings.
+#   plesk-slave-zone-cleanup update      Update from GitHub (only if the download is valid)
+#   plesk-slave-zone-cleanup status      Settings, next run and last runs
+#   plesk-slave-zone-cleanup uninstall   Remove schedule, settings and script
+#   plesk-slave-zone-cleanup version
+#
+#   One-line install: wget -qO- <raw URL> | sudo bash -s install
 #
 # Non-interactive: when there is no terminal (cron, ssh host cmd, pipes) the script never
 # asks anything. If yes/no is not given, zone files are deleted (yes). The "primary may be
@@ -57,13 +70,407 @@ interactive() { [ -t 0 ] && [ -t 1 ]; }
 TAG="plesk-slave-zone-cleanup"
 log_sys() { logger -t "$TAG" -- "$*" 2>/dev/null || true; }
 
+# ---------------------------------------------------------------------------
+# Installation, updates and scheduling
+# ---------------------------------------------------------------------------
+
+VERSION="1.0.0"
+REPO_RAW="${PSZC_REPO_RAW:-https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts}"   # override only for testing
+SCRIPT_PATH="/usr/local/sbin/plesk-slave-zone-cleanup"
+CONF_FILE="/etc/plesk-slave-zone-cleanup.conf"
+UNIT_DIR="/etc/systemd/system"
+CRON_FILE="/etc/cron.d/plesk-slave-zone-cleanup"
+MARKER="plesk-slave-zone-cleanup"        # must appear in a downloaded file before we install it
+
+die()  { echo "Error: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+warn() { echo "WARNING: $*" >&2; }
+
+# Re-run ourselves as root for management commands
+need_root() {
+    [ "$(id -u)" -eq 0 ] && return
+    if [ -f "$0" ] && command -v sudo >/dev/null 2>&1; then
+        exec sudo -- bash "$0" "$@"
+    fi
+    die "run this as root or with sudo"
+}
+
+# Which init system do we schedule with?
+has_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
+
+# Package manager and the package that provides dig on this distro
+pkg_manager() {
+    local pm
+    for pm in apt-get dnf yum zypper pacman apk; do
+        command -v "$pm" >/dev/null 2>&1 && { echo "$pm"; return; }
+    done
+}
+dig_package() {
+    case "$1" in
+        apt-get)
+            # Ubuntu 20.04+/Debian 11+: bind9-dnsutils; older: dnsutils
+            if apt-cache show bind9-dnsutils >/dev/null 2>&1; then echo bind9-dnsutils; else echo dnsutils; fi ;;
+        dnf|yum|zypper) echo bind-utils ;;
+        pacman)         echo bind ;;
+        apk)            echo bind-tools ;;
+    esac
+}
+pkg_install() {
+    local pm="$1"; shift
+    info "Installing $* with $pm"
+    case "$pm" in
+        apt-get) DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
+        dnf)     dnf install -y -q "$@" ;;
+        yum)     yum install -y -q "$@" ;;
+        zypper)  zypper --non-interactive --quiet install "$@" ;;
+        pacman)  pacman -S --noconfirm --needed "$@" ;;
+        apk)     apk add --quiet "$@" ;;
+        *)       return 1 ;;
+    esac
+}
+
+# Download a URL to a file with wget or curl, whichever exists
+download() {
+    if command -v wget >/dev/null 2>&1; then
+        wget -qO "$2" "$1"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$2" "$1"
+    else
+        return 127
+    fi
+}
+
+# Check that a file is a sane copy of this script
+valid_script() {
+    [ -s "$1" ] && head -n1 "$1" | grep -q '^#!/bin/bash' && grep -q "$MARKER" "$1" && bash -n "$1" 2>/dev/null
+}
+
+# Copy a file into place atomically (never leaves a half-written script)
+put_script() {
+    local tmp
+    tmp="$(mktemp "$(dirname "$SCRIPT_PATH")/.${MARKER}.XXXXXX")" || return 1
+    cat "$1" > "$tmp" && chmod 755 "$tmp" && chown root:root "$tmp" && mv -f "$tmp" "$SCRIPT_PATH" || { rm -f "$tmp"; return 1; }
+    command -v restorecon >/dev/null 2>&1 && restorecon "$SCRIPT_PATH" 2>/dev/null
+    return 0
+}
+
+load_conf() {
+    REF="main"; INTERVAL="1h"; FILES="yes"; AUTO_UPDATE="no"
+    # shellcheck disable=SC1090
+    [ -f "$CONF_FILE" ] && . "$CONF_FILE"
+}
+save_conf() {
+    cat > "$CONF_FILE" <<CONF
+# plesk-slave-zone-cleanup settings - written by '$MARKER install'.
+# Change them by running install again, e.g.: $MARKER install --interval 30min
+REF="$REF"
+INTERVAL="$INTERVAL"
+FILES="$FILES"
+AUTO_UPDATE="$AUTO_UPDATE"
+CONF
+    chmod 644 "$CONF_FILE"
+}
+
+# "1h", "30min", "15m" -> minutes (for cron)
+interval_minutes() {
+    case "$1" in
+        *min) echo "${1%min}" ;;
+        *m)   echo "${1%m}" ;;
+        *h)   echo $(( ${1%h} * 60 )) ;;
+        *)    echo "" ;;
+    esac
+}
+cron_spec() {
+    local m; m="$(interval_minutes "$1")"
+    if [ "$m" -lt 60 ]; then echo "*/$m * * * *"
+    else echo "$(( RANDOM % 60 )) */$(( m / 60 )) * * *"
+    fi
+}
+
+remove_schedules() {
+    if has_systemd; then
+        systemctl disable --now "$MARKER.timer" "$MARKER-update.timer" >/dev/null 2>&1
+        rm -f "$UNIT_DIR/$MARKER.service" "$UNIT_DIR/$MARKER.timer" \
+              "$UNIT_DIR/$MARKER-update.service" "$UNIT_DIR/$MARKER-update.timer"
+        systemctl daemon-reload
+    fi
+    rm -f "$CRON_FILE"
+    # Alpine/BusyBox crond: entries live in root's crontab between markers
+    if [ -f /etc/crontabs/root ] && grep -q "# BEGIN $MARKER" /etc/crontabs/root; then
+        sed -i "/# BEGIN $MARKER/,/# END $MARKER/d" /etc/crontabs/root
+    fi
+}
+
+write_schedules() {
+    local run_cmd="$SCRIPT_PATH $FILES"
+    local upd_cmd="$SCRIPT_PATH update --quiet"
+    if has_systemd; then
+        cat > "$UNIT_DIR/$MARKER.service" <<UNIT
+[Unit]
+Description=Remove stale Plesk slave zones from BIND
+After=network-online.target named.service bind9.service named-chroot.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$run_cmd
+# 2 = zones held back by the "primary may be down" safety check, not a failure
+SuccessExitStatus=2
+Nice=10
+UNIT
+        cat > "$UNIT_DIR/$MARKER.timer" <<UNIT
+[Unit]
+Description=Run $MARKER every $INTERVAL
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=$INTERVAL
+RandomizedDelaySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+        if [ "$AUTO_UPDATE" == "yes" ]; then
+            cat > "$UNIT_DIR/$MARKER-update.service" <<UNIT
+[Unit]
+Description=Update $MARKER from GitHub ($REF)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$upd_cmd
+UNIT
+            cat > "$UNIT_DIR/$MARKER-update.timer" <<UNIT
+[Unit]
+Description=Daily update of $MARKER
+
+[Timer]
+OnCalendar=*-*-* 04:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+        fi
+        command -v restorecon >/dev/null 2>&1 && restorecon "$UNIT_DIR"/"$MARKER"* 2>/dev/null
+        systemctl daemon-reload
+        systemctl enable --now "$MARKER.timer" >/dev/null || die "could not enable $MARKER.timer"
+        if [ "$AUTO_UPDATE" == "yes" ]; then
+            systemctl enable --now "$MARKER-update.timer" >/dev/null || die "could not enable $MARKER-update.timer"
+        fi
+        info "Scheduled with systemd timer(s)"
+    elif [ -d /etc/cron.d ] && ! command -v apk >/dev/null 2>&1; then
+        {
+            echo "# Installed by '$MARKER install' - change with '$MARKER install ...', not by hand"
+            echo "SHELL=/bin/bash"
+            echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            echo "$(cron_spec "$INTERVAL") root $run_cmd >/dev/null 2>&1"
+            [ "$AUTO_UPDATE" == "yes" ] && echo "$(( RANDOM % 60 )) 4 * * * root $upd_cmd >/dev/null 2>&1"
+        } > "$CRON_FILE"
+        chmod 644 "$CRON_FILE"
+        info "Scheduled with cron ($CRON_FILE)"
+    elif [ -d /etc/crontabs ]; then
+        {
+            echo "# BEGIN $MARKER"
+            echo "$(cron_spec "$INTERVAL") $run_cmd >/dev/null 2>&1"
+            [ "$AUTO_UPDATE" == "yes" ] && echo "$(( RANDOM % 60 )) 4 * * * $upd_cmd >/dev/null 2>&1"
+            echo "# END $MARKER"
+        } >> /etc/crontabs/root
+        info "Scheduled in /etc/crontabs/root (BusyBox crond)"
+        command -v rc-service >/dev/null 2>&1 && ! rc-service crond status >/dev/null 2>&1 && \
+            warn "crond is not running: rc-update add crond && rc-service crond start"
+    else
+        die "found neither systemd nor cron - schedule '$run_cmd' yourself"
+    fi
+}
+
+# Where named logs on this host (used by the main run and shown by install/status)
+log_source() {
+    if [ -n "${LOGFILE:-}" ]; then echo "$LOGFILE"; return; fi
+    local f
+    for f in /var/log/syslog /var/log/messages; do
+        as_root test -s "$f" && { echo "$f"; return; }
+    done
+    command -v journalctl >/dev/null 2>&1 && { echo "journal"; return; }
+    echo ""
+}
+
+cmd_install() {
+    local new_ref="" new_interval="" new_files="" new_auto="" src=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --interval)       new_interval="${2:-}"; shift ;;
+            --interval=*)     new_interval="${1#*=}" ;;
+            --ref)            new_ref="${2:-}"; shift ;;
+            --ref=*)          new_ref="${1#*=}" ;;
+            --keep-files)     new_files="no" ;;
+            --delete-files)   new_files="yes" ;;
+            --auto-update)    new_auto="yes" ;;
+            --no-auto-update) new_auto="no" ;;
+            *) die "unknown install option: $1" ;;
+        esac
+        shift
+    done
+    load_conf     # keep earlier settings unless overridden
+    REF="${new_ref:-$REF}"; INTERVAL="${new_interval:-$INTERVAL}"
+    FILES="${new_files:-$FILES}"; AUTO_UPDATE="${new_auto:-$AUTO_UPDATE}"
+
+    [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || die "invalid --ref '$REF'"
+    local mins; mins="$(interval_minutes "$INTERVAL")"
+    [[ "$mins" =~ ^[0-9]+$ ]] && [ "$mins" -ge 5 ] && [ "$mins" -le 1440 ] \
+        || die "invalid --interval '$INTERVAL' (use e.g. 15min, 30min, 1h, 6h; 5min-24h)"
+    if [ "$mins" -ge 60 ] && [ $(( mins % 60 )) -ne 0 ]; then
+        die "--interval over an hour must be whole hours (e.g. 2h)"
+    fi
+    INTERVAL="$( [ "$mins" -ge 60 ] && echo "$(( mins / 60 ))h" || echo "${mins}min" )"
+
+    info "$MARKER $VERSION - installing on $( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -s)"
+
+    # 1. Dependencies
+    local pm missing=()
+    pm="$(pkg_manager)"
+    command -v bash >/dev/null 2>&1 || die "bash is required"
+    command -v rndc >/dev/null 2>&1 || die "rndc not found - is BIND installed? This script runs on the secondary nameservers."
+    command -v dig  >/dev/null 2>&1 || missing+=("$(dig_package "$pm")")
+    command -v logger >/dev/null 2>&1 || case "$pm" in
+        apt-get) missing+=(bsdutils) ;; apk) missing+=(util-linux-misc) ;; *) missing+=(util-linux) ;; esac
+    if [ "$AUTO_UPDATE" == "yes" ] && ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+        missing+=(wget)
+    fi
+    if [ ${#missing[@]} -gt 0 ]; then
+        [ -n "$pm" ] || die "missing ${missing[*]} and no known package manager found - install them by hand"
+        pkg_install "$pm" "${missing[@]}" || die "could not install ${missing[*]}"
+    fi
+    command -v dig >/dev/null 2>&1 || die "dig is still missing after installing $(dig_package "$pm")"
+    info "Dependencies OK (rndc, dig, logger)"
+
+    # 2. The script itself
+    if [ -f "$0" ] && valid_script "$0"; then
+        if [ "$(readlink -f "$0")" != "$(readlink -f "$SCRIPT_PATH" 2>/dev/null)" ]; then
+            put_script "$0" || die "could not write $SCRIPT_PATH"
+        fi
+    else
+        # Running from a pipe (wget -qO- ... | sudo bash -s install): fetch a copy
+        src="$(mktemp)"
+        download "$REPO_RAW/$REF/$MARKER/$MARKER.sh" "$src" || { rm -f "$src"; die "download failed (needs wget or curl)"; }
+        valid_script "$src" || { rm -f "$src"; die "downloaded file is not a valid $MARKER script"; }
+        put_script "$src" || { rm -f "$src"; die "could not write $SCRIPT_PATH"; }
+        rm -f "$src"
+    fi
+    info "Installed $SCRIPT_PATH"
+
+    # 3. Sanity checks against BIND
+    if rndc status >/dev/null 2>&1; then
+        info "rndc can talk to BIND"
+    else
+        warn "'rndc status' failed - check rndc.key / controls in named.conf. Runs will fail until this works."
+    fi
+    if command -v named-checkconf >/dev/null 2>&1 && \
+       ! named-checkconf -p 2>/dev/null | grep -qE 'allow-new-zones[[:space:]]+(yes|true)'; then
+        warn "allow-new-zones is not enabled - rndc delzone only works for zones added with rndc addzone"
+    fi
+    local src_log; src_log="$(log_source)"
+    case "$src_log" in
+        "")      warn "no syslog file and no journalctl found - auto mode will find nothing (set LOGFILE=...)" ;;
+        journal) info "Reading named's log from the systemd journal" ;;
+        *)       info "Reading named's log from $src_log" ;;
+    esac
+
+    # 4. Schedule
+    save_conf
+    remove_schedules
+    write_schedules
+    log_sys "installed $VERSION (interval $INTERVAL, files $FILES, auto-update $AUTO_UPDATE, ref $REF)"
+
+    echo
+    info "Done. Runs every $INTERVAL, zone files: $( [ "$FILES" == yes ] && echo deleted || echo kept ), auto-update: $AUTO_UPDATE$( [ "$AUTO_UPDATE" == yes ] && echo " (from '$REF')" )"
+    echo "    See what the next run would do:  $MARKER dryrun"
+    echo "    Status and last runs:            $MARKER status"
+    exit 0
+}
+
+cmd_update() {
+    local quiet="" new
+    [ "${1:-}" == "--quiet" ] && quiet=1
+    load_conf
+    new="$(mktemp)"
+    if ! download "$REPO_RAW/$REF/$MARKER/$MARKER.sh" "$new"; then
+        rm -f "$new"; log_sys "update failed: download from $REF failed"; die "download failed"
+    fi
+    if ! valid_script "$new"; then
+        rm -f "$new"; log_sys "update refused: downloaded file is not valid"; die "downloaded file is not a valid $MARKER script - keeping the current one"
+    fi
+    if cmp -s "$new" "$SCRIPT_PATH"; then
+        rm -f "$new"; [ -n "$quiet" ] || info "Already up to date ($VERSION)"; exit 0
+    fi
+    local newver; newver="$(sed -nE 's/^VERSION="([^"]+)".*/\1/p' "$new" | head -n1)"
+    put_script "$new" || { rm -f "$new"; die "could not write $SCRIPT_PATH"; }
+    rm -f "$new"
+    log_sys "updated $VERSION -> ${newver:-?} from $REF"
+    info "Updated $VERSION -> ${newver:-?}"
+    # Rewrite the schedule with the new version, in case the unit layout changed
+    "$SCRIPT_PATH" install >/dev/null || warn "re-running install after update failed"
+    exit 0
+}
+
+cmd_uninstall() {
+    remove_schedules
+    rm -f "$CONF_FILE" "$SCRIPT_PATH"
+    log_sys "uninstalled"
+    info "Removed schedule, $CONF_FILE and $SCRIPT_PATH. BIND and its zones are untouched."
+    exit 0
+}
+
+cmd_status() {
+    load_conf
+    echo "$MARKER $VERSION"
+    if [ -f "$CONF_FILE" ]; then
+        echo "Settings: every $INTERVAL, files $FILES, auto-update $AUTO_UPDATE (ref $REF)"
+    else
+        echo "Not installed as a scheduled job (run: sudo $MARKER install)"
+    fi
+    echo "Log source: $(log_source)"
+    if has_systemd && [ -f "$UNIT_DIR/$MARKER.timer" ]; then
+        echo
+        systemctl list-timers --all "$MARKER.timer" "$MARKER-update.timer" --no-pager 2>/dev/null
+        echo
+        echo "Last runs:"
+        as_root journalctl -u "$MARKER.service" -u "$MARKER-update.service" -n 20 --no-pager -o short 2>/dev/null
+    elif [ -f "$CRON_FILE" ] || grep -qs "# BEGIN $MARKER" /etc/crontabs/root; then
+        echo; echo "cron:"; cat "$CRON_FILE" 2>/dev/null || sed -n "/# BEGIN $MARKER/,/# END $MARKER/p" /etc/crontabs/root
+        echo; echo "Recent removals (syslog):"
+        { as_root grep -h "$TAG" /var/log/syslog /var/log/messages 2>/dev/null || true; } | tail -n 20
+    fi
+    exit 0
+}
+
+case "${1:-}" in
+    install)   need_root "$@"; shift; cmd_install "$@" ;;
+    update)    need_root "$@"; shift; cmd_update "$@" ;;
+    uninstall) need_root "$@"; shift; cmd_uninstall "$@" ;;
+    status)    shift; cmd_status "$@" ;;
+    version|--version) echo "$MARKER $VERSION"; exit 0 ;;
+esac
+
+# Only one cleanup run at a time
+if [ "$(id -u)" -eq 0 ] && command -v flock >/dev/null 2>&1; then
+    if { exec 9>"/run/$MARKER.lock"; } 2>/dev/null; then
+        flock -n 9 || { echo "Another run is in progress."; exit 0; }
+    fi
+fi
+
 usage() {
     echo "Usage: $(basename "$0") [IP-ADDRESS] [yes/no] [dryrun]"
     echo "       $(basename "$0") <ZONE> [ZONE...] [yes/no] [dryrun] [force]"
+    echo "       $(basename "$0") install [--interval 1h] [--keep-files] [--auto-update] [--ref main]"
+    echo "       $(basename "$0") update | status | uninstall | version"
     exit 1
 }
 
-LOGFILE="${LOGFILE:-/var/log/syslog}"   # Override with: LOGFILE=/var/log/named.log plesk-slave-zone-cleanup ...
+LOGFILE="$(log_source)"   # syslog/messages file or "journal"; override with LOGFILE=/path ...
 TARGET_IP=""
 MANUAL_ZONES=()
 DELETE_FILES=""
@@ -125,16 +532,24 @@ fi
 
 for cmd in rndc dig; do
     if ! command -v "$cmd" >/dev/null 2>&1 && ! as_root sh -c "command -v $cmd" >/dev/null 2>&1; then
-        echo "Error: '$cmd' not found (dig is in the bind9-dnsutils / dnsutils package)."
+        echo "Error: '$cmd' not found. Run: sudo $MARKER install (installs what is missing)"
         exit 1
     fi
 done
 
 
-# Read the log (incl. rotated .1) - using sudo if the user lacks read access
+# Read the log: syslog/messages file (incl. the newest rotated copy) or the systemd journal.
+# Uses sudo if the user lacks read access.
 read_log() {
-    local f
-    for f in "$LOGFILE.1" "$LOGFILE"; do
+    local f rotated
+    if [ "$LOGFILE" == "journal" ]; then
+        # named logs with the syslog identifier "named" on every distro
+        as_root journalctl --since "-2 days" --no-pager -o cat -t named 2>/dev/null
+        return
+    fi
+    # Debian: syslog.1, RHEL: messages-YYYYMMDD (compressed copies are skipped)
+    rotated="$(as_root sh -c "ls -1t '$LOGFILE'.1 '$LOGFILE'-[0-9]* 2>/dev/null | grep -v '\\.gz$' | head -n1")"
+    for f in $rotated "$LOGFILE"; do
         if [ -r "$f" ]; then cat "$f"
         elif as_root test -f "$f"; then as_root cat "$f"
         fi
@@ -177,7 +592,10 @@ if [ ${#MANUAL_ZONES[@]} -gt 0 ]; then
         REASON["$z"]="MANUAL"
     done
 else
-    if ! as_root test -f "$LOGFILE"; then
+    if [ -z "$LOGFILE" ]; then
+        echo "Error: no syslog file (/var/log/syslog, /var/log/messages) and no journalctl. Set LOGFILE=/path."
+        exit 1
+    elif [ "$LOGFILE" != "journal" ] && ! as_root test -f "$LOGFILE"; then
         echo "Error: Log file $LOGFILE does not exist!"
         exit 1
     fi
