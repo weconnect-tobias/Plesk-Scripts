@@ -98,7 +98,7 @@ TAG="dns-zone-cleanup"
 EVENT_LOG="/var/log/dns-zone-cleanup.log"   # events for the daily mail report
 
 # Log an event to syslog/journal and to our own event log.
-# Types: REMOVED FAILED HELD MANUAL PENDING UPDATED INSTALLED ERROR
+# Types: REMOVED FAILED HELD MANUAL PENDING STALEPRIMARY UPDATED INSTALLED ERROR
 log_event() {
     local type="$1"; shift
     logger -t "$TAG" -- "$type: $*" 2>/dev/null || true
@@ -784,7 +784,7 @@ send_mail() {
 }
 
 cmd_report() {
-    local mode="send" always="" host now last events n_rem n_fail n_held n_upd n_err n_inst n_man n_pend subject parts=()
+    local mode="send" always="" host now last events n_rem n_fail n_held n_upd n_err n_inst n_man n_pend n_sp subject parts=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --test)   mode="test" ;;
@@ -825,8 +825,8 @@ cmd_report() {
     n_held=$(grep -c ' HELD ' <<<"$events");   n_upd=$(grep -c ' UPDATED ' <<<"$events")
     n_err=$(grep -c ' ERROR ' <<<"$events");   n_inst=$(grep -c ' INSTALLED ' <<<"$events")
     n_man=$(grep ' MANUAL ' <<<"$events" | awk '{print $5}' | sort -u | grep -c .)
-    n_pend=$(grep -c ' PENDING ' <<<"$events")
-    [ -z "$events" ] && { n_rem=0; n_fail=0; n_held=0; n_upd=0; n_err=0; n_inst=0; n_man=0; n_pend=0; }
+    n_pend=$(grep -c ' PENDING ' <<<"$events"); n_sp=$(grep ' STALEPRIMARY ' <<<"$events" | awk '{print $5}' | sort -u | grep -c .)
+    [ -z "$events" ] && { n_rem=0; n_fail=0; n_held=0; n_upd=0; n_err=0; n_inst=0; n_man=0; n_pend=0; n_sp=0; }
 
     if [ -z "$events" ] && [ -z "$always" ] && [ "$mode" == "send" ]; then
         echo "$total $now" > "$STATE_DIR/last-report"
@@ -838,6 +838,7 @@ cmd_report() {
     [ "$n_held" -gt 0 ] && parts+=("held back")
     [ "$n_man" -gt 0 ]  && parts+=("$n_man to remove by hand")
     [ "$n_pend" -gt 0 ] && parts+=("$n_pend no longer delegated")
+    [ "$n_sp" -gt 0 ]   && parts+=("$n_sp stale primary zone(s)")
     [ "$n_err" -gt 0 ]  && parts+=("errors")
     [ "$n_upd" -gt 0 ]  && parts+=("updated")
     [ "$n_inst" -gt 0 ] && parts+=("settings changed")
@@ -868,6 +869,7 @@ cmd_report() {
         fi
         section FAILED  "FAILED - needs attention:"
         section MANUAL  "Stale zones to remove by hand:"
+        section STALEPRIMARY "Primary zones on this server whose domain uses other nameservers (not changed - switch them off if they are no longer needed):"
         section PENDING "No longer delegated to this server (removed after $DELEGATION_DAYS days unless that changes):"
         section HELD    "Held back - a primary did not answer (is it down?):"
         section ERROR   "Errors:"
@@ -1058,10 +1060,21 @@ fi
 # Main config file
 NAMED_CONF="${NAMED_CONF:-}"
 if [ -z "$NAMED_CONF" ]; then
-    for f in /etc/bind/named.conf /etc/named.conf /etc/namedb/named.conf /usr/local/etc/namedb/named.conf; do
+    for f in /etc/bind/named.conf /etc/named.conf /etc/namedb/named.conf /usr/local/etc/namedb/named.conf \
+             /var/named/run-root/etc/named.conf /var/named/chroot/etc/named.conf; do
         as_root test -f "$f" && { NAMED_CONF="$f"; break; }
     done
 fi
+
+# BIND in a chroot (RHEL named-chroot, Plesk run-root): paths in its config are inside the chroot
+CHROOT=""
+case "$NAMED_CONF" in */chroot/etc/*|*/run-root/etc/*) CHROOT="${NAMED_CONF%/etc/*}" ;; esac
+in_root() { if [ -n "$CHROOT" ] && [[ "$1" == /* ]] && [[ "$1" != "$CHROOT"/* ]]; then echo "$CHROOT$1"; else echo "$1"; fi; }
+checkconf() {
+    if [ -n "$CHROOT" ]; then as_root named-checkconf -t "$CHROOT" "${NAMED_CONF#"$CHROOT"}"
+    else as_root named-checkconf "$NAMED_CONF"
+    fi
+}
 
 if [ -z "$RNDC_OK" ]; then
     if [ -z "$NAMED_CONF" ]; then
@@ -1090,11 +1103,12 @@ rndc_has() { [ "${RNDC_HAS[$1]:-no}" == "yes" ]; }
 BIND_DIR=""
 bind_directory() {
     if [ -z "$BIND_DIR" ]; then
-        BIND_DIR="$(as_root named-checkconf -p 2>/dev/null | sed -nE 's/(^|.*[{;[:space:]])directory[[:space:]]+"([^"]+)".*/\2/p' | head -n1)"
+        [ -z "$CHROOT" ] && BIND_DIR="$(as_root named-checkconf -p 2>/dev/null | sed -nE 's/(^|.*[{;[:space:]])directory[[:space:]]+"([^"]+)".*/\2/p' | head -n1)"
         if [ -z "$BIND_DIR" ] && [ -n "$NAMED_CONF" ]; then
             BIND_DIR="$(conf_files | while read -r f; do as_root cat "$f"; done 2>/dev/null \
                 | sed -nE 's/(^|.*[{;[:space:]])directory[[:space:]]+"([^"]+)".*/\2/p' | head -n1)"
         fi
+        [ -n "$BIND_DIR" ] && BIND_DIR="$(in_root "$BIND_DIR")"
         if [ -z "$BIND_DIR" ]; then
             for d in /var/cache/bind /var/named /var/lib/bind /etc/namedb; do
                 as_root test -d "$d" && { BIND_DIR="$d"; break; }
@@ -1118,7 +1132,7 @@ conf_files() {
             echo "$f" >> "$TMPD/conf_files"
             base="$(dirname "$f")"
             while read -r inc; do
-                [[ "$inc" != /* ]] && inc="$base/$inc"
+                if [[ "$inc" != /* ]]; then inc="$base/$inc"; else inc="$(in_root "$inc")"; fi
                 # shellcheck disable=SC2086  # glob expansion wanted (BIND 9.18+ allows globs)
                 for g in $inc; do queue+=("$g"); done
             done < <(as_root cat "$f" | sed -E 's://.*$::; s:#.*$::' \
@@ -1459,10 +1473,147 @@ delegation_scan() {
         fi
     done
 }
+
+# ---------------------------------------------------------------------------
+# Primary (master) zones: report-only check for domains that have left this server.
+# A master is usually not listed in the domain's NS records itself (the secondaries are),
+# so here the TLD's NS records are compared with the NS records in the zone itself:
+#   OURS    = the TLD delegates to (some of) the zone's own nameservers -> fine
+#   MOVED   = the TLD delegates to other nameservers only -> this server serves a stale copy
+#   UNREG   = the domain no longer exists at the TLD
+# Nothing is ever changed for primary zones. They are listed in the output and the report,
+# with the command to switch them off (Plesk) after DELEGATION_DAYS days.
+# ---------------------------------------------------------------------------
+
+primary_zones() { zone_index | awk -F'\t' '$7 == "master" || $7 == "primary" { print $1 }' | sort -u; }
+
+# NS names of a zone as this server serves it
+zone_own_ns() {
+    local out ip
+    for ip in 127.0.0.1 ::1 ${!OWN[@]}; do
+        out="$(dig +norec +time=2 +tries=1 +noall +answer NS "$1." @"$ip" 2>/dev/null)"
+        [ -n "$out" ] && break
+    done
+    awk -v z="$1." 'tolower($1) == tolower(z) && $4 == "NS" { print tolower($5) }' <<<"$out" | sed 's/\.$//' | sort -u
+}
+
+name_ips() { local n; for n in "$@"; do dig +short +time=3 +tries=1 A "$n" 2>/dev/null; dig +short +time=3 +tries=1 AAAA "$n" 2>/dev/null; done | sort -u; }
+
+# Sets PSTATUS for primary zone $1 (uses delegation_status for the TLD side)
+primary_status() {
+    local z="$1" own tld_ips own_ips n
+    delegation_status "$z"
+    case "$DSTATUS" in
+        SUBZONE|UNKNOWN|UNREG) PSTATUS="$DSTATUS"; return ;;
+    esac
+    own="$(zone_own_ns "$z")"
+    [ -z "$own" ] && { PSTATUS="UNKNOWN"; return; }
+    for n in $DNS_LIST; do
+        grep -qxF "$n" <<<"$own" && { PSTATUS="OURS"; return; }
+    done
+    # Different names can still be the same servers (vanity nameservers)
+    # shellcheck disable=SC2086
+    tld_ips="$(name_ips $DNS_LIST)"; own_ips="$(name_ips $own)"
+    if [ -n "$tld_ips" ] && [ -n "$own_ips" ] && [ -n "$(comm -12 <(echo "$tld_ips") <(echo "$own_ips"))" ]; then
+        PSTATUS="OURS"; return
+    fi
+    PSTATUS="MOVED"
+}
+
+off_hint() {
+    if command -v plesk >/dev/null 2>&1; then echo "plesk bin dns --off $1"
+    else echo "remove the zone from this server's config"
+    fi
+}
+
+PRIMARY_STATE="$STATE_DIR/primary-delegation.tsv"   # zone <TAB> status <TAB> since <TAB> ns <TAB> notified
+STALE_PRIMARY_LIST=()
+
+# Daily. With $1 = show it only prints a table.
+primary_scan() {
+    local mode="${1:-}" now last zones=() z st since ns notified total=0 bad=0 age
+    declare -A NEW=() OLD=()
+    [ "$DELEGATION" == "off" ] && [ "$mode" != "show" ] && return
+    mapfile -t zones < <(primary_zones)
+    [ ${#zones[@]} -eq 0 ] && return
+    now="$(date +%s)"
+    last="$(as_root cat "$STATE_DIR/primary-delegation.last" 2>/dev/null || echo 0)"
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if as_root test -f "$PRIMARY_STATE"; then
+        while IFS=$'\t' read -r z st since ns notified; do
+            OLD["$z"]="$st"$'\t'"$since"$'\t'"$ns"$'\t'"${notified:-0}"; NEW["$z"]="${OLD[$z]}"
+        done < <(as_root cat "$PRIMARY_STATE")
+    fi
+
+    if [ "$mode" == "show" ] || [ $(( now - last )) -ge 72000 ]; then
+        [ ${#OWN[@]} -eq 0 ] && own_ips_load
+        declare -A CURRENT=()
+        for z in "${zones[@]}"; do CURRENT["$z"]=1; done
+        for z in "${!NEW[@]}"; do [ -n "${CURRENT[$z]:-}" ] || unset 'NEW[$z]'; done
+        [ "$mode" == "show" ] && { echo; echo "Zones this server is primary for:"; row "ZONE" "STATUS" "SINCE" "NAMESERVERS AT THE TLD"; row "----" "------" "-----" "----------------------"; }
+        for z in "${zones[@]}"; do
+            if [ ${#MANUAL_ZONES[@]} -gt 0 ] && [[ " ${MANUAL_ZONES[*]} " != *" $z "* ]]; then continue; fi
+            is_excluded "$z" && { unset 'NEW[$z]'; [ "$mode" == "show" ] && row "$z" "EXCLUDED" "-" "-"; continue; }
+            primary_status "$z"
+            case "$PSTATUS" in
+                MOVED|UNREG)
+                    total=$((total + 1)); bad=$((bad + 1))
+                    IFS=$'\t' read -r st since ns notified <<<"${OLD[$z]:-}"
+                    if [ "$st" != "$PSTATUS" ] || [ -z "$since" ]; then since="$now"; notified=0; fi
+                    NEW["$z"]="$PSTATUS"$'\t'"$since"$'\t'"$DNS_LIST"$'\t'"${notified:-0}" ;;
+                OURS)    total=$((total + 1)); unset 'NEW[$z]' ;;
+                SUBZONE) unset 'NEW[$z]' ;;
+                UNKNOWN) ;;
+            esac
+            if [ "$mode" == "show" ]; then
+                since="-"; [ -n "${NEW[$z]:-}" ] && since="$(date -d "@$(cut -f2 <<<"${NEW[$z]}")" +%F 2>/dev/null)"
+                row "$z" "$PSTATUS" "$since" "${DNS_LIST:--}"
+            fi
+        done
+        if [ "$total" -ge 4 ] && [ $(( bad * 2 )) -gt "$total" ]; then
+            echo "WARNING: $bad of $total primary zones look delegated elsewhere - that is unlikely, so nothing is reported. Check: $MARKER delegation"
+            [ "$mode" == "show" ] || [ -n "$DRYRUN" ] || log_event ERROR "primary zone check: $bad of $total zones look delegated elsewhere - ignored, check '$MARKER delegation'"
+            return
+        fi
+        if [ "$mode" != "show" ] && [ -z "$DRYRUN" ]; then
+            as_root mkdir -p "$STATE_DIR"
+            for z in "${!NEW[@]}"; do printf '%s\t%s\n' "$z" "${NEW[$z]}"; done | as_root tee "$PRIMARY_STATE.tmp" >/dev/null
+            as_root mv -f "$PRIMARY_STATE.tmp" "$PRIMARY_STATE"
+            echo "$now" | as_root tee "$STATE_DIR/primary-delegation.last" >/dev/null
+        fi
+    fi
+    [ "$mode" == "show" ] && return
+
+    # Tell about each stale primary zone twice: when it is first seen, and when it has
+    # stayed like that for DELEGATION_DAYS days
+    local changed=""
+    for z in "${!NEW[@]}"; do
+        IFS=$'\t' read -r st since ns notified <<<"${NEW[$z]}"
+        [[ "$since" =~ ^[0-9]+$ ]] || continue
+        age=$(( (now - since) / 86400 ))
+        what="$( [ "$st" == UNREG ] && echo "the domain no longer exists at the TLD" || echo "the TLD delegates it to ${ns:-other nameservers}")"
+        STALE_PRIMARY_LIST+=("$z: $what (since $(date -d "@$since" +%F 2>/dev/null)) - $(off_hint "$z")")
+        [ -n "$DRYRUN" ] && continue
+        if [ "${notified:-0}" -lt 1 ]; then
+            log_event STALEPRIMARY "$z: $what, but this server is still primary for it - $(off_hint "$z")"
+            notified=1; changed=1
+        elif [ "$notified" -lt 2 ] && [ "$age" -ge "$DELEGATION_DAYS" ]; then
+            log_event STALEPRIMARY "$z: still $( [ "$st" == UNREG ] && echo "not registered" || echo "delegated to ${ns:-other nameservers}") after $age days - switch it off here: $(off_hint "$z")"
+            notified=2; changed=1
+        fi
+        NEW["$z"]="$st"$'\t'"$since"$'\t'"$ns"$'\t'"$notified"
+    done
+    if [ -n "$changed" ]; then
+        for z in "${!NEW[@]}"; do printf '%s\t%s\n' "$z" "${NEW[$z]}"; done | as_root tee "$PRIMARY_STATE.tmp" >/dev/null
+        as_root mv -f "$PRIMARY_STATE.tmp" "$PRIMARY_STATE"
+    fi
+}
+
 PENDING_LIST=()
 
 if [ -n "$DELEG_SHOW" ]; then
     delegation_scan show
+    primary_scan show
     exit 0
 fi
 
@@ -1544,10 +1695,27 @@ fi
 
 # Delegation check (auto mode only; once a day)
 if [ -n "$AUTO" ]; then
-    delegation_scan
+    N_SECONDARY="$(zone_index | awk -F'\t' '$7 == "slave" || $7 == "secondary"' | cut -f1 | sort -u | grep -c .)"
+    N_PRIMARY="$(primary_zones | grep -c .)"
+    if [ "$N_SECONDARY" -gt 0 ] || [ "$N_PRIMARY" -eq 0 ]; then
+        delegation_scan
+    fi
     if [ ${#PENDING_LIST[@]} -gt 0 ]; then
         echo "Not delegated here, removed when the waiting time is over:"
         printf '  %s\n' "${PENDING_LIST[@]}"
+    fi
+    if [ "$N_PRIMARY" -gt 0 ]; then
+        primary_scan
+        if [ "$N_SECONDARY" -eq 0 ]; then
+            echo "This server is primary for $N_PRIMARY zone(s) and has no secondary zones."
+            echo "Secondary zones are what $MARKER cleans up; primary zones are only checked and reported, never changed."
+        fi
+        if [ ${#STALE_PRIMARY_LIST[@]} -gt 0 ]; then
+            echo "Primary zones whose domain no longer uses this server's nameservers (not changed, see the report):"
+            printf '  %s\n' "${STALE_PRIMARY_LIST[@]}"
+        elif [ "$DELEGATION" != "off" ]; then
+            echo "All primary zones checked so far are delegated to their own nameservers."
+        fi
     fi
 fi
 if [ ${#REASON[@]} -eq 0 ]; then
@@ -1887,7 +2055,7 @@ if [ ${#CONF_LIST[@]} -gt 0 ]; then
         as_root sh -c "cat '$TMPD/new.conf' > '$cf'" || { conf_ok=""; break; }
     done
     if [ -n "$conf_ok" ] && command -v named-checkconf >/dev/null 2>&1; then
-        if ! out="$(as_root named-checkconf "$NAMED_CONF" 2>&1)"; then
+        if ! out="$(checkconf 2>&1)"; then
             echo "  ERROR: named-checkconf failed after commenting out zones:"; echo "$out" | sed 's/^/    /'
             conf_ok=""
         fi

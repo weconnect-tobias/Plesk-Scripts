@@ -65,6 +65,25 @@ sudo dns-zone-cleanup install --delegation report   # list in the report, never 
 sudo dns-zone-cleanup install --delegation off
 ```
 
+### On a primary (master) server
+
+Installed on a primary, for example a Plesk server, the script changes nothing: there are no secondary zones to clean up, and zones this server is primary for are never touched. It says so:
+
+```
+This server is primary for 412 zone(s) and has no secondary zones.
+Secondary zones are what dns-zone-cleanup cleans up; primary zones are only checked and reported, never changed.
+```
+
+It does run a daily, **report-only** check of the primary zones. That catches the old-server case: a domain that has moved to another DNS host, or has expired, while this server still serves its zone. A primary is usually not in the domain's NS records itself, so here the TLD's NS records are compared with the NS records **in the zone**:
+
+| Status | Meaning |
+|---|---|
+| `OURS` | The TLD delegates to the zone's own nameservers, or to other names with the same addresses |
+| `MOVED` | The TLD delegates to other nameservers only. This server serves a stale copy. |
+| `UNREG` | The domain no longer exists at the TLD |
+
+Each stale zone is reported twice in the mail report: the day it is found, and again after `--delegation-days` days if it stays like that. The report includes the command to switch it off; on Plesk that is `plesk bin dns --off example.se`. `dns-zone-cleanup delegation` shows the table for all primary zones.
+
 Zones that should never be touched by any check:
 
 ```bash
@@ -157,7 +176,7 @@ The script adapts to what the server has:
 
 Large logs are no problem: the log is searched as a stream and only the refresh errors are kept, so memory use stays at a few MB however big `/var/log/syslog` is.
 
-If `named.conf` is somewhere else (e.g. a chroot), set `NAMED_CONF=/var/named/chroot/etc/named.conf`.
+BIND in a chroot (RHEL `named-chroot`, Plesk's `/var/named/run-root`) is found automatically; paths in its config are read inside the chroot. If `named.conf` is somewhere else, set `NAMED_CONF=/path/to/named.conf`.
 
 ## Requirements
 
