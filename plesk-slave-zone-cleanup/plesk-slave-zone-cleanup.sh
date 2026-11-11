@@ -14,12 +14,14 @@
 # If the primary answers authoritatively again (zone re-enabled), it is skipped.
 #
 # Usage:
+#   plesk-slave-zone-cleanup [yes/no] [dryrun]
+#       Find broken zones in the log, whatever their primary (auto mode)
 #   plesk-slave-zone-cleanup <IP-ADDRESS> [yes/no] [dryrun]
-#       Find zones in the log for this primary
+#       Same, but only zones for this primary
 #   plesk-slave-zone-cleanup <ZONE> [ZONE...] [yes/no] [dryrun] [force]
 #       Remove specific zone(s) directly
 #
-#   <IP-ADDRESS> Primary DNS server (Plesk) to look for in the log
+#   <IP-ADDRESS> Only look for zones from this primary DNS server (Plesk)
 #   <ZONE>       Zone name(s), e.g. example.com. The primary is read from
 #                'rndc showzone' and checked live before removal.
 #   yes/no       Also delete the zone file (yes = rndc delzone -clean)
@@ -30,15 +32,19 @@
 #
 # Non-interactive: when there is no terminal (cron, ssh host cmd, pipes) the script never
 # asks anything. If yes/no is not given, zone files are deleted (yes). The "primary may be
-# down" safety check aborts instead of asking. Every removal is logged to syslog with the
+# down" safety check skips those zones instead of asking. Every removal is logged to syslog with the
 # tag plesk-slave-zone-cleanup.
 #
-# Exit codes: 0 = OK (or nothing to do), 1 = error or a removal failed, 2 = aborted by safety check.
+# Exit codes: 0 = OK (or nothing to do), 1 = error or a removal failed,
+#             2 = zones held back by the "primary may be down" safety check.
 #
 # Run as a regular sudo user (e.g. ubuntu); running as root also works.
 # MIT license.
 
 set -uo pipefail
+
+# cron runs with PATH=/usr/bin:/bin, but rndc and named-checkconf live in /usr/sbin
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 # Run a command as root: directly if we already are root, otherwise via sudo
 as_root() {
@@ -52,7 +58,7 @@ TAG="plesk-slave-zone-cleanup"
 log_sys() { logger -t "$TAG" -- "$*" 2>/dev/null || true; }
 
 usage() {
-    echo "Usage: $(basename "$0") <IP-ADDRESS> [yes/no] [dryrun]"
+    echo "Usage: $(basename "$0") [IP-ADDRESS] [yes/no] [dryrun]"
     echo "       $(basename "$0") <ZONE> [ZONE...] [yes/no] [dryrun] [force]"
     exit 1
 }
@@ -73,6 +79,7 @@ for arg in "$@"; do
         yes|y|no|n) DELETE_FILES="$a" ;;
         dryrun)     DRYRUN="dryrun" ;;
         force)      FORCE="force" ;;
+        -h|--help|help) usage ;;
         *)
             if is_ip "$a"; then
                 [ -n "$TARGET_IP" ] && { echo "Error: only one IP address can be given."; exit 1; }
@@ -90,8 +97,10 @@ if [ -n "$TARGET_IP" ] && [ ${#MANUAL_ZONES[@]} -gt 0 ]; then
     echo "Error: give either a primary IP address or zone name(s), not both."
     exit 1
 fi
-[ -z "$TARGET_IP" ] && [ ${#MANUAL_ZONES[@]} -eq 0 ] && usage
-if [ -n "$FORCE" ] && [ -n "$TARGET_IP" ]; then
+# No IP and no zones: auto mode, look at every primary in the log
+AUTO=""
+[ -z "$TARGET_IP" ] && [ ${#MANUAL_ZONES[@]} -eq 0 ] && AUTO="auto"
+if [ -n "$FORCE" ] && [ ${#MANUAL_ZONES[@]} -eq 0 ]; then
     echo "Error: 'force' can only be used together with zone names."
     exit 1
 fi
@@ -133,7 +142,11 @@ read_log() {
 }
 
 # Escape dots in the IP and require #port after it, so 192.0.2.10 does not match 192.0.2.100
-IP_RE="${TARGET_IP//./\\.}#[0-9]+"
+if [ -n "$TARGET_IP" ]; then
+    IP_RE="${TARGET_IP//./\\.}#[0-9]+"
+else
+    IP_RE="[0-9a-fA-F.:]+#[0-9]+"        # auto mode: any primary
+fi
 # BIND 9.18+ logs "primary", older versions "master"
 SRC_RE="(primary|master) $IP_RE"
 
@@ -169,7 +182,11 @@ else
         exit 1
     fi
 
-    echo "Searching for zones with primary $TARGET_IP in $LOGFILE..."
+    if [ -n "$AUTO" ]; then
+        echo "Searching for zones failing to refresh from any primary in $LOGFILE..."
+    else
+        echo "Searching for zones with primary $TARGET_IP in $LOGFILE..."
+    fi
     LOGDATA="$(read_log)"
 
     mapfile -t RETRY_ZONES    < <(printf '%s\n' "$LOGDATA" | extract_zones "$RETRY_RE")
@@ -184,7 +201,7 @@ else
     done
 
     if [ ${#REASON[@]} -eq 0 ]; then
-        echo "No zones with problems against $TARGET_IP found."
+        echo "No zones with problems${TARGET_IP:+ against $TARGET_IP} found."
         exit 0
     fi
 fi
@@ -245,6 +262,7 @@ zone_exists_locally() {
 
 TO_REMOVE=()
 SKIPPED=()
+declare -A LIVE=()
 
 echo
 printf "%-40s %-9s %-10s %s\n" "ZONE" "SOURCE" "PRIMARY" "ACTION"
@@ -265,6 +283,10 @@ for ZONE in $(printf '%s\n' "${!REASON[@]}" | sort); do
             SKIPPED+=("$ZONE")
             continue
         fi
+    elif [ -n "$AUTO" ] && [ -z "${PRIMARY[$ZONE]}" ]; then
+        printf "%-40s %-9s %-10s %s\n" "$ZONE" "$why" "UNKNOWN" "skip (primary not found in zone config)"
+        SKIPPED+=("$ZONE")
+        continue
     fi
     # shellcheck disable=SC2086  # word-split the space separated primaries on purpose
     live="$(check_all_primaries "$ZONE" ${PRIMARY[$ZONE]})"
@@ -297,6 +319,7 @@ for ZONE in $(printf '%s\n' "${!REASON[@]}" | sort); do
             fi ;;
     esac
     printf "%-40s %-9s %-10s %s\n" "$ZONE" "$why" "$live" "$action"
+    LIVE["$ZONE"]="$live"
     if [ "$action" == "REMOVE" ]; then TO_REMOVE+=("$ZONE"); else SKIPPED+=("$ZONE"); fi
 done
 echo
@@ -306,21 +329,47 @@ if [ ${#TO_REMOVE[@]} -eq 0 ]; then
     exit 0
 fi
 
-# Safety check: if many zones are only being removed because the primary times out,
-# the primary may simply be down - we don't want to wipe everything.
-TIMEOUT_COUNT=0
+# Safety check, per primary: if 10+ zones of the same primary are only being removed
+# because it times out, that primary is probably down - don't wipe its zones.
+SAFETY_HELD=0
+declare -A TIMEOUT_BY_PRIMARY=()
 for ZONE in "${TO_REMOVE[@]}"; do
-    [ "${REASON[$ZONE]}" == "RETRY" ] && TIMEOUT_COUNT=$((TIMEOUT_COUNT + 1))
+    [ "${LIVE[$ZONE]}" == "TIMEOUT" ] || continue
+    k="${PRIMARY[$ZONE]:-unknown}"
+    TIMEOUT_BY_PRIMARY["$k"]=$(( ${TIMEOUT_BY_PRIMARY["$k"]:-0} + 1 ))
 done
-if [ "$TIMEOUT_COUNT" -ge 10 ] && [ "$TIMEOUT_COUNT" -eq ${#TO_REMOVE[@]} ] && [[ "$DRYRUN" != "dryrun" ]]; then
-    echo "WARNING: $TIMEOUT_COUNT zones where the primary does not answer at all. Is $TARGET_IP down?"
-    if ! interactive; then
-        echo "Aborting (non-interactive). Run it by hand to confirm."
-        log_sys "aborted: $TIMEOUT_COUNT zones with primary $TARGET_IP timing out - primary may be down"
-        exit 2
+for k in "${!TIMEOUT_BY_PRIMARY[@]}"; do
+    n="${TIMEOUT_BY_PRIMARY[$k]}"
+    [ "$n" -ge 10 ] || continue
+    echo "WARNING: $n zones where primary $k does not answer at all. Is it down?"
+    if [[ "$DRYRUN" == "dryrun" ]]; then
+        echo "  (a real run would ask before removing them, or hold them back without a terminal)"
+        continue
     fi
-    read -r -p "Type 'YES' to remove them anyway: " confirm
-    [ "$confirm" == "YES" ] || { echo "Aborting."; exit 2; }
+    keep=0
+    if interactive; then
+        read -r -p "Type 'YES' to remove these $n zones anyway: " confirm
+        [ "$confirm" == "YES" ] && keep=1
+    fi
+    if [ "$keep" -eq 0 ]; then
+        echo "  Holding back the $n zones of primary $k."
+        log_sys "held back $n zones: primary $k timing out - may be down"
+        NEW=()
+        for ZONE in "${TO_REMOVE[@]}"; do
+            if [ "${LIVE[$ZONE]}" == "TIMEOUT" ] && [ "${PRIMARY[$ZONE]:-unknown}" == "$k" ]; then
+                SKIPPED+=("$ZONE")
+            else
+                NEW+=("$ZONE")
+            fi
+        done
+        TO_REMOVE=("${NEW[@]}")
+        SAFETY_HELD=$((SAFETY_HELD + n))
+    fi
+done
+if [ ${#TO_REMOVE[@]} -eq 0 ]; then
+    echo "No zones to remove."
+    [ "$SAFETY_HELD" -gt 0 ] && exit 2
+    exit 0
 fi
 
 if [[ "$DRYRUN" == "dryrun" ]]; then
@@ -395,4 +444,6 @@ done
 
 # rndc delzone takes effect immediately; no rndc reload needed.
 echo "Cleanup completed! Removed: $REMOVED, failed: $FAILED, skipped: ${#SKIPPED[@]}."
-[ "$FAILED" -eq 0 ]
+[ "$FAILED" -gt 0 ] && exit 1
+[ "$SAFETY_HELD" -gt 0 ] && exit 2
+exit 0
