@@ -114,7 +114,7 @@ log_event() {
 # Installation, updates and scheduling
 # ---------------------------------------------------------------------------
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 REPO_RAW="${PSZC_REPO_RAW:-https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts}"   # override only for testing
 REPO_API="${PSZC_REPO_API:-https://api.github.com/repos/weconnect-tobias/Plesk-Scripts}"
 TAG_PREFIX="dns-zone-cleanup-v"   # releases of this script are tagged dns-zone-cleanup-v1.2.3
@@ -818,8 +818,88 @@ send_mail() {
     return $rc
 }
 
+# ---------------------------------------------------------------------------
+# Text helpers for messages and the report
+# ---------------------------------------------------------------------------
+
+# "ns1.example.se ns2.example.se ns3.example.se" -> "ns1-ns3.example.se"; otherwise "a, b, c"
+ns_short() {
+    tr ' ' '\n' <<<"$*" | grep -v '^$' | sort -V | awk '
+        { names[++n] = $0
+          if (match($0, /^[a-z-]*[0-9]+\./)) {
+              head = substr($0, 1, RLENGTH - 1); rest = substr($0, RLENGTH + 1)
+              p = head; sub(/[0-9]+$/, "", p); d = substr(head, length(p) + 1)
+              key = p "|" rest
+              if (n == 1) { k = key; lo = d + 0; hi = d + 0; ok = 1; pre = p; suf = rest }
+              else if (key != k || d + 0 != hi + 1) ok = 0
+              else hi = d + 0
+          } else ok = 0 }
+        END {
+            if (n >= 3 && ok) { print pre lo "-" pre hi "." suf; exit }
+            for (i = 1; i <= n; i++) printf "%s%s", (i > 1 ? ", " : ""), names[i]; print ""
+        }'
+}
+
+# Wrap text $2 to width $3 (default 76), first line prefixed with $1, the rest indented to match
+wrap() {
+    awk -v pre="$1" -v w="${3:-76}" -v t="$2" 'BEGIN {
+        ind = sprintf("%" length(pre) "s", ""); n = split(t, a, " "); line = pre; empty = 1
+        for (i = 1; i <= n; i++) {
+            if (!empty && length(line " " a[i]) > w) { print line; line = ind a[i] }
+            else { line = line (empty ? "" : " ") a[i]; empty = 0 }
+        }
+        print line }'
+}
+
+reason_text() {
+    case "$1" in
+        RETRY)    echo "its primary no longer answers for it" ;;
+        DISABLED) echo "its primary no longer has it" ;;
+        MOVED)    echo "the domain is no longer delegated to this server" ;;
+        UNREG)    echo "the domain no longer exists" ;;
+        MANUAL)   echo "removed on request" ;;
+        PMOVED)   echo "the domain has moved to another primary" ;;
+        PUNREG)   echo "the domain no longer exists" ;;
+        *)        echo "$1" ;;
+    esac
+}
+
+# What to do about a stale primary zone. $2 = "file:line" of its zone statement (or empty)
+primary_todo() {
+    if command -v plesk >/dev/null 2>&1; then
+        echo "Switch DNS off for it in Plesk: plesk bin dns --off $1"
+    elif [ -n "${2:-}" ] && [ "$2" != "-" ]; then
+        echo "Remove or comment out the zone in ${2%:*} (line ${2##*:}), then run: named-checkconf && rndc reconfig"
+    else
+        echo "Remove the zone from this server's BIND config, then run: named-checkconf && rndc reconfig"
+    fi
+}
+
+# Explanation of a primary zone's status. $1 status, $2 delegated NS, $3 detail (my_m|my_s|th_ns|th_m|th_s)
+primary_what() {
+    local st="$1" ns my_m my_s th_ns th_m th_s
+    ns="$(ns_short "$2")"
+    IFS='|' read -r my_m my_s th_ns th_m th_s <<<"${3:-}"
+    case "$st" in
+        UNREG)
+            echo "The domain does not exist any more (expired or deleted)." ;;
+        MOVED)
+            if [ -n "$th_s" ] && [ "$th_m" != "$my_m" ]; then
+                echo "Moved to another primary. The domain uses ${ns:-other nameservers}, and they serve a version from $th_m (serial $th_s). The copy here ($my_m, serial $my_s) is not used."
+            elif [ -n "$th_s" ]; then
+                echo "Probably moved. The domain uses ${ns:-other nameservers}, and they serve a newer version (serial $th_s) than this server (serial $my_s)."
+            else
+                echo "Moved. The domain uses ${ns:-other nameservers}. ${3:-}"
+            fi ;;
+        ELSEWHERE)
+            echo "The domain uses ${ns:-other nameservers}, which this server's zone does not list. Their version of the zone could not be read, so it is not certain that the zone moved." ;;
+        BEHIND)
+            echo "The secondaries (${ns:-?}) have an older version (serial $th_s) than this server (serial $my_s). They don't get updates from here: check zone transfers and NOTIFY to them." ;;
+    esac
+}
+
 cmd_report() {
-    local mode="send" always="" host now last events n_rem n_fail n_held n_upd n_err n_inst n_man n_pend n_sp n_beh subject parts=()
+    local mode="send" always="" host now last events subject parts=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --test)   mode="test" ;;
@@ -852,70 +932,168 @@ cmd_report() {
     done_lines="${state%% *}"; last="${state##* }"
     [[ "$done_lines" =~ ^[0-9]+$ ]] || done_lines=0
     [[ "$last" =~ ^[0-9]+$ ]] && [ "$last" -gt 0 ] || last=$(( now - 86400 ))
-    total="$(wc -l < "$EVENT_LOG" 2>/dev/null || echo 0)"
+    total="$( { wc -l < "$EVENT_LOG"; } 2>/dev/null || echo 0)"
     [ "$done_lines" -gt "$total" ] && done_lines=0          # log was trimmed or replaced
     events="$(tail -n +"$(( done_lines + 1 ))" "$EVENT_LOG" 2>/dev/null)"
-
-    n_rem=$(grep -c ' REMOVED ' <<<"$events"); n_fail=$(grep -c ' FAILED ' <<<"$events")
-    n_held=$(grep -c ' HELD ' <<<"$events");   n_upd=$(grep -c ' UPDATED ' <<<"$events")
-    n_err=$(grep -c ' ERROR ' <<<"$events");   n_inst=$(grep -c ' INSTALLED ' <<<"$events")
-    n_man=$(grep ' MANUAL ' <<<"$events" | awk '{print $5}' | sort -u | grep -c .)
-    n_pend=$(grep -c ' PENDING ' <<<"$events"); n_sp=$(grep ' STALEPRIMARY ' <<<"$events" | awk '{print $5}' | sort -u | grep -c .)
-    n_beh=$(grep ' BEHIND ' <<<"$events" | awk '{print $5}' | sort -u | grep -c .)
-    [ -z "$events" ] && { n_rem=0; n_fail=0; n_held=0; n_upd=0; n_err=0; n_inst=0; n_man=0; n_pend=0; n_sp=0; n_beh=0; }
 
     if [ -z "$events" ] && [ -z "$always" ] && [ "$mode" == "send" ]; then
         echo "$total $now" > "$STATE_DIR/last-report"
         exit 0      # nothing happened, no mail
     fi
 
-    [ "$n_rem" -gt 0 ]  && parts+=("$n_rem removed")
-    [ "$n_fail" -gt 0 ] && parts+=("$n_fail FAILED")
-    [ "$n_held" -gt 0 ] && parts+=("held back")
-    [ "$n_man" -gt 0 ]  && parts+=("$n_man to remove by hand")
-    [ "$n_pend" -gt 0 ] && parts+=("$n_pend no longer delegated")
-    [ "$n_sp" -gt 0 ]   && parts+=("$n_sp stale primary zone(s)")
-    [ "$n_beh" -gt 0 ]  && parts+=("$n_beh zone(s) behind on secondaries")
-    [ "$n_err" -gt 0 ]  && parts+=("errors")
-    [ "$n_upd" -gt 0 ]  && parts+=("updated")
-    [ "$n_inst" -gt 0 ] && parts+=("settings changed")
-    [ ${#parts[@]} -eq 0 ] && parts+=("no changes")
-    subject="[$host] $MARKER: $(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')"
+    # Current state: stale primary zones (still served here) and secondaries waiting for removal
+    local -a P_ATT=() P_BEH=() WAIT=()
+    local z st since ns notified strict detail where days
+    if [ -s "$STATE_DIR/primary-delegation.tsv" ]; then
+        # Most certain first: moved to another primary, gone, probably moved, unclear
+        while IFS=$'\t' read -r _ z st since ns notified strict detail where; do
+            # Skip zones that were removed in the meantime
+            dig +norec +time=2 +tries=1 SOA "$z." @127.0.0.1 2>/dev/null | grep -qE 'flags:[^;]* aa' || continue
+            # Fields stay "-" when empty: IFS=tab would skip empty fields
+            if [ "$st" == "BEHIND" ]; then P_BEH+=("$z"$'\t'"$st"$'\t'"$since"$'\t'"${ns:--}"$'\t'"${detail:--}"$'\t'"${where:--}")
+            else P_ATT+=("$z"$'\t'"$st"$'\t'"$since"$'\t'"${ns:--}"$'\t'"${detail:--}"$'\t'"${where:--}")
+            fi
+        done < <(awk -F'\t' '{ p = ($2 == "MOVED" && $6 == "1") ? 1 : ($2 == "UNREG") ? 2 : ($2 == "MOVED") ? 3 : 4
+                               print p "\t" $0 }' "$STATE_DIR/primary-delegation.tsv" | sort -t$'\t' -k1,1n -k2,2)
+    fi
+    if [ "$DELEGATION" == "on" ] && [ -s "$STATE_DIR/delegation.tsv" ]; then
+        while IFS=$'\t' read -r z st since ns; do
+            [[ "$since" =~ ^[0-9]+$ ]] || continue
+            days=$(( (since + DELEGATION_DAYS * 86400 - now + 86399) / 86400 ))
+            [ "$days" -lt 1 ] && days=1
+            # Skip zones that are already gone
+            dig +norec +time=2 +tries=1 SOA "$z." @127.0.0.1 2>/dev/null | grep -qE 'flags:[^;]* aa' || continue
+            WAIT+=("$z"$'\t'"$st"$'\t'"$since"$'\t'"${ns:--}"$'\t'"$days")
+        done < <(sort "$STATE_DIR/delegation.tsv")
+    fi
 
-    section() {   # $1 = type, $2 = heading. Repeated messages are shown once with a count.
-        local lines
-        lines="$(grep " $1 " <<<"$events" | awk '{
-                    t = $2 " " $3; $1 = $2 = $3 = $4 = ""; sub(/^ +/, "")
-                    if (!($0 in n)) order[++k] = $0
-                    n[$0]++; if (!($0 in first)) first[$0] = t; lastt[$0] = t
-                 } END {
-                    for (i = 1; i <= k; i++) { m = order[i]
-                        if (n[m] == 1) print "  " lastt[m] "  " m
-                        else print "  " first[m] " - " lastt[m] "  " m "  (" n[m] " times)" }
-                 }')"
-        [ -z "$lines" ] && return
-        echo "$2"; echo "$lines"; echo
+    count() { grep " $1 " <<<"$events" | awk '{print $5}' | sed 's/[:,]$//' | sort -u | grep -c .; }
+    local n_rem n_fail n_held n_man n_err n_upd n_inst
+    n_rem=$(grep -c ' REMOVED ' <<<"$events"); n_fail=$(count FAILED); n_held=$(grep -c ' HELD ' <<<"$events")
+    n_man=$(count MANUAL); n_err=$(grep -c ' ERROR ' <<<"$events")
+    n_upd=$(grep -c ' UPDATED ' <<<"$events"); n_inst=$(grep -c ' INSTALLED ' <<<"$events")
+
+    [ "$n_fail" -gt 0 ]      && parts+=("$n_fail failed")
+    [ "$n_man" -gt 0 ]       && parts+=("$n_man to remove by hand")
+    [ ${#P_ATT[@]} -gt 0 ]   && parts+=("${#P_ATT[@]} unused primary zone(s)")
+    [ ${#P_BEH[@]} -gt 0 ]   && parts+=("${#P_BEH[@]} out of sync")
+    [ "$n_held" -gt 0 ]      && parts+=("held back")
+    [ "$n_err" -gt 0 ]       && parts+=("errors")
+    [ "$n_rem" -gt 0 ]       && parts+=("$n_rem removed")
+    [ ${#WAIT[@]} -gt 0 ]    && parts+=("${#WAIT[@]} waiting")
+    [ ${#parts[@]} -eq 0 ] && { [ $((n_upd + n_inst)) -gt 0 ] && parts+=("updated") || parts+=("all OK"); }
+    subject="[$host] DNS zone cleanup: $(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')"
+
+    # Event lines of a type, newest message per subject, repeated ones counted
+    lines_of() {
+        grep " $1 " <<<"$events" | awk '{
+            t = $2 " " substr($3, 1, 5); $1 = $2 = $3 = $4 = ""; sub(/^ +/, "")
+            if (!($0 in n)) order[++k] = $0
+            n[$0]++; lastt[$0] = t
+        } END { for (i = 1; i <= k; i++) { m = order[i]
+                    print lastt[m] "\t" m (n[m] > 1 ? "  (" n[m] " times)" : "") } }'
     }
+    rule() { printf '%s\n' "────────────────────────────────────────────────────────────────────────────"; }
+    heading() { echo; echo "$1"; rule; }
+
     body() {
-        echo "Report from $MARKER $VERSION on $host"
-        echo "Period: $(date -d "@$last" '+%F %T' 2>/dev/null || echo "$last") - $(date -d "@$now" '+%F %T' 2>/dev/null || echo "$now")"
-        echo
-        if [ -z "$events" ]; then
-            echo "Nothing happened. All zones the primaries no longer serve were already gone."
-            echo
+        local l t m z st since ns detail where days
+
+        echo "DNS zone cleanup report for $host"
+        echo "$(date -d "@$last" '+%Y-%m-%d %H:%M' 2>/dev/null) to $(date -d "@$now" '+%Y-%m-%d %H:%M' 2>/dev/null) (server time)"
+
+        # Summary
+        heading "SUMMARY"
+        local any=""
+        [ "$n_fail" -gt 0 ]    && { echo "  ! $n_fail zone removal(s) failed"; any=1; }
+        [ "$n_man" -gt 0 ]     && { echo "  ! $n_man stale zone(s) must be removed by hand"; any=1; }
+        [ ${#P_ATT[@]} -gt 0 ] && { echo "  ! ${#P_ATT[@]} zone(s) this server is primary for are no longer in use"; any=1; }
+        [ ${#P_BEH[@]} -gt 0 ] && { echo "  ! ${#P_BEH[@]} zone(s) are out of sync on the secondaries"; any=1; }
+        [ "$n_held" -gt 0 ]    && { echo "  ! Zones were held back because a primary did not answer"; any=1; }
+        [ "$n_err" -gt 0 ]     && { echo "  ! $n_err error(s)"; any=1; }
+        [ -z "$any" ]          && echo "  Nothing needs your attention."
+        [ "$n_rem" -gt 0 ]     && echo "    $n_rem stale zone(s) removed"
+        [ ${#WAIT[@]} -gt 0 ]  && echo "    ${#WAIT[@]} zone(s) waiting to be removed (no longer delegated here)"
+        [ "$n_upd" -gt 0 ]     && echo "    Script updated to $VERSION"
+
+        # Needs attention
+        if [ "$n_fail" -gt 0 ]; then
+            heading "FAILED REMOVALS"
+            while IFS=$'\t' read -r t m; do wrap "  $t  " "$m"; done < <(lines_of FAILED)
         fi
-        section FAILED  "FAILED - needs attention:"
-        section MANUAL  "Stale zones to remove by hand:"
-        section STALEPRIMARY "Primary zones on this server that are no longer used (switch them off if they are not needed):"
-        section BEHIND  "Primary zones whose secondaries have an older version (zone transfers from this server failing?):"
-        section PENDING "No longer delegated to this server (removed after $DELEGATION_DAYS days unless that changes):"
-        section HELD    "Held back - a primary did not answer (is it down?):"
-        section ERROR   "Errors:"
-        section REMOVED "Removed zones:"
-        section UPDATED "Script updated:"
-        section INSTALLED "Installed / settings changed:"
-        echo "Settings: every $INTERVAL, zone files $FILES, zones in named.conf $CONF_ZONES, auto-update $AUTO_UPDATE"
-        echo "Full log: $EVENT_LOG on $host"
+        if [ "$n_man" -gt 0 ]; then
+            heading "REMOVE BY HAND"
+            echo "  No primary serves these zones any more, but the script could not remove"
+            echo "  them safely itself."
+            echo
+            while IFS=$'\t' read -r t m; do wrap "  " "$m"; done < <(lines_of MANUAL)
+        fi
+        if [ ${#P_ATT[@]} -gt 0 ]; then
+            heading "PRIMARY ZONES NO LONGER IN USE"
+            echo "  This server is still primary for these zones, but the domains don't use it"
+            echo "  any more. Nothing has been changed. Remove them when you have checked them."
+            for l in "${P_ATT[@]}"; do
+                IFS=$'\t' read -r z st since ns detail where <<<"$l"
+                [ "$ns" == "-" ] && ns=""; [ "$detail" == "-" ] && detail=""; [ "$where" == "-" ] && where=""
+                echo
+                echo "  $z"
+                wrap "    What:    " "$(primary_what "$st" "$ns" "$detail")"
+                echo "    Since:   $(date -d "@$since" +%F 2>/dev/null)"
+                wrap "    To do:   " "$(primary_todo "$z" "$where")"
+            done
+        fi
+        if [ ${#P_BEH[@]} -gt 0 ]; then
+            heading "OUT OF SYNC ON THE SECONDARIES"
+            for l in "${P_BEH[@]}"; do
+                IFS=$'\t' read -r z st since ns detail where <<<"$l"
+                [ "$ns" == "-" ] && ns=""; [ "$detail" == "-" ] && detail=""
+                echo
+                echo "  $z"
+                wrap "    What:    " "$(primary_what "$st" "$ns" "$detail")"
+                echo "    Since:   $(date -d "@$since" +%F 2>/dev/null)"
+            done
+        fi
+        if [ "$n_held" -gt 0 ]; then
+            heading "HELD BACK"
+            while IFS=$'\t' read -r t m; do wrap "  $t  " "$m"; done < <(lines_of HELD)
+        fi
+        if [ "$n_err" -gt 0 ]; then
+            heading "ERRORS"
+            while IFS=$'\t' read -r t m; do wrap "  $t  " "$m"; done < <(lines_of ERROR)
+        fi
+
+        # For information
+        if [ "$n_rem" -gt 0 ]; then
+            heading "REMOVED ZONES"
+            while IFS=$'\t' read -r t m; do wrap "  $t  " "$m"; done < <(lines_of REMOVED)
+        fi
+        if [ ${#WAIT[@]} -gt 0 ]; then
+            heading "WAITING TO BE REMOVED"
+            echo "  These domains are no longer delegated to this server. Their zones are"
+            echo "  removed when that has been the case for $DELEGATION_DAYS days in a row."
+            echo
+            for l in "${WAIT[@]}"; do
+                IFS=$'\t' read -r z st since ns days <<<"$l"; [ "$ns" == "-" ] && ns=""
+                if [ "$st" == "UNREG" ]; then m="domain no longer exists"; else m="uses $(ns_short "$ns")"; fi
+                printf '  %-34s %s, removed in %s day(s)\n' "$z" "$m" "$days"
+            done
+        fi
+        if [ $((n_upd + n_inst)) -gt 0 ]; then
+            heading "SCRIPT"
+            if [ "$n_upd" -gt 0 ]; then
+                echo "  Updated: $(grep ' UPDATED ' <<<"$events" | head -n1 | awk '{print $5}') -> $VERSION"
+            fi
+            [ "$n_inst" -gt 0 ] && echo "  Installed or settings changed ($n_inst time(s))"
+        fi
+
+        heading "SETTINGS"
+        echo "  Runs every $INTERVAL. Zone files of removed zones: $FILES."
+        echo "  Delegation check: $DELEGATION ($DELEGATION_DAYS days). Zones in named.conf: $CONF_ZONES."
+        echo "  Primary zones: $PRIMARY_ZONES. Auto-update: $AUTO_UPDATE."
+        echo
+        echo "  More on $host: dns-zone-cleanup status | dns-zone-cleanup delegation"
+        echo "  Full log: $EVENT_LOG"
+        echo "  $MARKER $VERSION"
     }
 
     if [ "$mode" == "print" ]; then
@@ -1936,7 +2114,7 @@ primary_status() {
     delegation_status "$z"
     case "$DSTATUS" in
         SUBZONE|UNKNOWN) PSTATUS="$DSTATUS"; return ;;
-        UNREG) PSTATUS="UNREG"; PSTRICT=1; PDETAIL="the domain does not exist at the TLD"; return ;;
+        UNREG) PSTATUS="UNREG"; PSTRICT=1; PDETAIL=""; return ;;
     esac
     own="$(zone_own_ns "$z")"
     [ -z "$own" ] && { PSTATUS="UNKNOWN"; return; }
@@ -1957,10 +2135,10 @@ primary_status() {
         [ -n "$theirs" ] && { theirs_ns="$n"; break; }
     done
     if [ -z "$mine" ] || [ -z "$theirs" ]; then
-        PSTATUS="ELSEWHERE"; PDETAIL="delegated to ${DNS_LIST:-?}; their version could not be read"; return
+        PSTATUS="ELSEWHERE"; PDETAIL=""; return
     fi
     read -r my_m my_s <<<"$mine"; read -r th_m th_s <<<"$theirs"
-    PDETAIL="here: $my_m serial $my_s - at $theirs_ns: $th_m serial $th_s"
+    PDETAIL="$my_m|$my_s|$theirs_ns|$th_m|$th_s"      # machine format, see primary_what
     if [ "$th_s" == "$my_s" ]; then PSTATUS="OURS"; return; fi
     if [ "$th_m" != "$my_m" ]; then PSTATUS="MOVED"; PSTRICT=1; return; fi
     if [[ "$th_s" =~ ^[0-9]+$ && "$my_s" =~ ^[0-9]+$ ]] && [ "$th_s" -lt "$my_s" ]; then
@@ -1975,12 +2153,12 @@ off_hint() {
     fi
 }
 
-# zone <TAB> status <TAB> since <TAB> ns <TAB> notified <TAB> strict <TAB> detail
+# zone <TAB> status <TAB> since <TAB> ns <TAB> notified <TAB> strict <TAB> detail <TAB> where
 PRIMARY_STATE="$STATE_DIR/primary-delegation.tsv"
 STALE_PRIMARY_LIST=()
 
 # Fields are never empty in the state file ("-" / 0), since read with IFS=tab would skip them
-pfields() { [ "$ns" == "-" ] && ns=""; [ "$detail" == "-" ] && detail=""; [ "$strict" == "1" ] || strict=""; }
+pfields() { [ "$ns" == "-" ] && ns=""; [ "$detail" == "-" ] && detail=""; [ "$where" == "-" ] && where=""; [ "$strict" == "1" ] || strict=""; }
 
 save_primary_state() {
     local z
@@ -1992,7 +2170,7 @@ save_primary_state() {
 # Daily. With $1 = show it only prints a table.
 declare -A PNEW=()
 primary_scan() {
-    local mode="${1:-}" now last zones=() z st since ns notified strict detail total=0 bad=0 age what
+    local mode="${1:-}" now last zones=() z st since ns notified strict detail where total=0 bad=0 age what
     declare -A OLD=()
     PNEW=()
     [ "$DELEGATION" == "off" ] && [ "$mode" != "show" ] && return
@@ -2002,8 +2180,10 @@ primary_scan() {
     last="$(as_root cat "$STATE_DIR/primary-delegation.last" 2>/dev/null || echo 0)"
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     if as_root test -f "$PRIMARY_STATE"; then
-        while IFS=$'\t' read -r z st since ns notified strict detail; do
-            OLD["$z"]="$st"$'\t'"$since"$'\t'"$ns"$'\t'"${notified:-0}"$'\t'"$strict"$'\t'"$detail"; PNEW["$z"]="${OLD[$z]}"
+        while IFS=$'\t' read -r z st since ns notified strict detail where; do
+            # Older versions wrote a free-text detail: drop it, it is refreshed at the next check
+            [[ "$detail" == *"|"* ]] || detail="-"
+            OLD["$z"]="$st"$'\t'"$since"$'\t'"$ns"$'\t'"${notified:-0}"$'\t'"${strict:-0}"$'\t'"$detail"$'\t'"${where:--}"; PNEW["$z"]="${OLD[$z]}"
         done < <(as_root cat "$PRIMARY_STATE")
     fi
 
@@ -2025,9 +2205,10 @@ primary_scan() {
             case "$PSTATUS" in
                 MOVED|UNREG|BEHIND|ELSEWHERE)
                     total=$((total + 1)); [ "$PSTATUS" != "BEHIND" ] && bad=$((bad + 1))
-                    IFS=$'\t' read -r st since ns notified strict detail <<<"${OLD[$z]:-}"; pfields
+                    IFS=$'\t' read -r st since ns notified strict detail where <<<"${OLD[$z]:-}"; pfields
                     if [ "$st" != "$PSTATUS" ] || [ -z "$since" ]; then since="$now"; notified=0; fi
-                    PNEW["$z"]="$PSTATUS"$'\t'"$since"$'\t'"${DNS_LIST:--}"$'\t'"${notified:-0}"$'\t'"${PSTRICT:-0}"$'\t'"${PDETAIL:--}" ;;
+                    where="$(zone_entry "$z" | awk -F'\t' '$6 == "conf" { print $2 ":" $3 }')"
+                    PNEW["$z"]="$PSTATUS"$'\t'"$since"$'\t'"${DNS_LIST:--}"$'\t'"${notified:-0}"$'\t'"${PSTRICT:-0}"$'\t'"${PDETAIL:--}"$'\t'"${where:--}" ;;
                 OURS)    total=$((total + 1)); unset 'PNEW[$z]' ;;
                 SUBZONE) unset 'PNEW[$z]' ;;
                 UNKNOWN) ;;
@@ -2037,7 +2218,7 @@ primary_scan() {
                     hidden=$((hidden + 1)); continue
                 fi
                 since="-"; [ -n "${PNEW[$z]:-}" ] && since="$(date -d "@$(cut -f2 <<<"${PNEW[$z]}")" +%F 2>/dev/null)"
-                row "$z" "$PSTATUS" "$since" "${PDETAIL:-${DNS_LIST:--}}"
+                row "$z" "$PSTATUS" "$since" "$(primary_what "$PSTATUS" "$DNS_LIST" "$PDETAIL" | cut -c1-120)"
             fi
         done
         [ "$mode" == "show" ] && [ "$hidden" -gt 0 ] && echo "($hidden zone(s) OK or not checked - add 'verbose' to list them)"
@@ -2057,40 +2238,35 @@ primary_scan() {
     # DELEGATION_DAYS days. With --primary-zones comment, unambiguous cases are then removed.
     local changed=""
     for z in "${!PNEW[@]}"; do
-        IFS=$'\t' read -r st since ns notified strict detail <<<"${PNEW[$z]}"; pfields
+        IFS=$'\t' read -r st since ns notified strict detail where <<<"${PNEW[$z]}"; pfields
         [[ "$since" =~ ^[0-9]+$ ]] || continue
         age=$(( (now - since) / 86400 ))
-        case "$st" in
-            UNREG)     what="the domain no longer exists at the TLD" ;;
-            MOVED)     what="the domain is served by another primary (${detail:-delegated to $ns})" ;;
-            ELSEWHERE) what="the domain is delegated to ${ns:-other nameservers}, which this server's zone doesn't list" ;;
-            BEHIND)    what="the secondaries ($ns) have an older version (${detail}) - are zone transfers or NOTIFY from this server failing?" ;;
-        esac
+        what="$(primary_what "$st" "$ns" "$detail")"
         if [ "$st" == "BEHIND" ]; then
-            STALE_PRIMARY_LIST+=("$z: secondaries are behind - $detail")
+            STALE_PRIMARY_LIST+=("$z: $what")
         else
-            STALE_PRIMARY_LIST+=("$z: $what (since $(date -d "@$since" +%F 2>/dev/null)) - $(off_hint "$z")")
+            STALE_PRIMARY_LIST+=("$z: $what To do: $(primary_todo "$z" "$where")")
         fi
         # Remove unambiguous cases after the waiting time, if asked to
         if [ "$PRIMARY_ZONES" == "comment" ] && [ -n "$strict" ] && [ "$age" -ge "$DELEGATION_DAYS" ] \
            && [ "$st" != "BEHIND" ] && ! command -v plesk >/dev/null 2>&1 && [ -z "${REASON[$z]:-}" ]; then
             REASON["$z"]="$( [ "$st" == UNREG ] && echo PUNREG || echo PMOVED)"
-            DELEG_INFO["$z"]="$what, since $(date -d "@$since" +%F 2>/dev/null)"
+            DELEG_INFO["$z"]="$what Since $(date -d "@$since" +%F 2>/dev/null)."
         fi
         [ -n "$DRYRUN" ] && continue
         if [ "${notified:-0}" -lt 1 ]; then
             if [ "$st" == "BEHIND" ]; then log_event BEHIND "$z: $what"
-            else log_event STALEPRIMARY "$z: $what, but this server still serves it - $(off_hint "$z")"
+            else log_event STALEPRIMARY "$z: no longer in use here. $what $(primary_todo "$z" "$where")"
             fi
             notified=1; changed=1
         elif [ "$notified" -lt 2 ] && [ "$age" -ge "$DELEGATION_DAYS" ]; then
-            if [ "$st" == "BEHIND" ]; then log_event BEHIND "$z: still behind after $age days - $detail"
+            if [ "$st" == "BEHIND" ]; then log_event BEHIND "$z: still out of sync after $age days. $what"
             elif [ "$PRIMARY_ZONES" == "comment" ] && [ -n "$strict" ] && ! command -v plesk >/dev/null 2>&1; then :
-            else log_event STALEPRIMARY "$z: still the case after $age days - $what. Switch it off here: $(off_hint "$z")"
+            else log_event STALEPRIMARY "$z: still not in use after $age days. $what $(primary_todo "$z" "$where")"
             fi
             notified=2; changed=1
         fi
-        PNEW["$z"]="$st"$'\t'"$since"$'\t'"${ns:--}"$'\t'"$notified"$'\t'"${strict:-0}"$'\t'"${detail:--}"
+        PNEW["$z"]="$st"$'\t'"$since"$'\t'"${ns:--}"$'\t'"$notified"$'\t'"${strict:-0}"$'\t'"${detail:--}"$'\t'"${where:--}"
     done
     [ -n "$changed" ] && save_primary_state
     return 0
@@ -2198,8 +2374,8 @@ if [ -n "$AUTO" ]; then
             echo "Secondary zones are what $MARKER cleans up; primary zones are only checked and reported, never changed."
         fi
         if [ ${#STALE_PRIMARY_LIST[@]} -gt 0 ]; then
-            echo "Primary zones that look unused or out of sync (not changed, see the report):"
-            printf '  %s\n' "${STALE_PRIMARY_LIST[@]}"
+            echo "Primary zones that look unused or out of sync (nothing changed):"
+            for l in "${STALE_PRIMARY_LIST[@]}"; do wrap "  - " "$l" 100; done
         elif [ "$DELEGATION" != "off" ]; then
             echo "All primary zones checked so far are delegated to their own nameservers."
         fi
@@ -2518,7 +2694,7 @@ for ZONE in "${TO_REMOVE[@]}"; do
     fi
     handle_files "$ZONE" "${PATHS[@]}"
     echo "  OK: zone removed, $(file_note "$ZONE")"
-    log_event REMOVED "$ZONE, $(file_note "$ZONE") (${REASON[$ZONE]}${PRIMARY[$ZONE]:+, primary ${PRIMARY[$ZONE]}})"
+    log_event REMOVED "$ZONE: $(reason_text "${REASON[$ZONE]}"). Removed with rndc delzone, $(file_note "$ZONE")."
     REMOVED=$((REMOVED + 1))
 done
 
@@ -2596,7 +2772,7 @@ if [ ${#CONF_LIST[@]} -gt 0 ]; then
                 note="zone file left alone until BIND is reloaded"   # BIND still has the zone loaded
             fi
             echo "  OK: $ZONE commented out in ${WHERE[$ZONE]%:*}, $note"
-            log_event REMOVED "$ZONE, commented out in ${WHERE[$ZONE]%:*} (backup $BACKUP_ROOT/config), $note (${REASON[$ZONE]}${PRIMARY[$ZONE]:+, primary ${PRIMARY[$ZONE]}})"
+            log_event REMOVED "$ZONE: $(reason_text "${REASON[$ZONE]}"). Commented out in ${WHERE[$ZONE]%:*} (backup made), $note."
             REMOVED=$((REMOVED + 1))
         done
     fi
@@ -2606,7 +2782,7 @@ fi
 for ZONE in "${TO_REMOVE[@]}"; do
     [ "${METHOD[$ZONE]}" == "MANUAL" ] || continue
     echo "Remove by hand: $ZONE - ${WHERE[$ZONE]}"
-    log_event MANUAL "$ZONE: no primary serves it, remove by hand - ${WHERE[$ZONE]}"
+    log_event MANUAL "$ZONE: $(reason_text "${REASON[$ZONE]}"), but it could not be removed safely here: ${WHERE[$ZONE]}"
     MANUAL_COUNT=$((MANUAL_COUNT + 1))
 done
 
