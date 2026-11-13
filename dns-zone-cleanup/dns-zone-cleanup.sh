@@ -27,9 +27,11 @@
 #       Remove specific zone(s) directly
 #   dns-zone-cleanup delegation [ZONE...]
 #       Show the delegation check for all (or the given) secondary zones, change nothing
-#   dns-zone-cleanup list [primary|secondary] [csv]
+#   dns-zone-cleanup list [primary|secondary] [registrar] [csv]
 #       List all zones on this server: type, primary IPs, how they were added, delegation
-#       status, and a count per primary. Changes nothing.
+#       status, and a count per primary. Changes nothing. "registrar" also looks up each
+#       domain's registrar (whois for .se/.nu and other ccTLDs, RDAP for .com etc.),
+#       cached for 30 days in /var/lib/dns-zone-cleanup/registrar.tsv.
 #
 #   delete|yes   Delete the zone file of a removed zone (default, see --delete-files)
 #   keep|no      Keep the zone file
@@ -117,7 +119,7 @@ log_event() {
 # Installation, updates and scheduling
 # ---------------------------------------------------------------------------
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 REPO_RAW="${PSZC_REPO_RAW:-https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts}"   # override only for testing
 REPO_API="${PSZC_REPO_API:-https://api.github.com/repos/weconnect-tobias/Plesk-Scripts}"
 TAG_PREFIX="dns-zone-cleanup-v"   # releases of this script are tagged dns-zone-cleanup-v1.2.3
@@ -1281,12 +1283,16 @@ Only look at log entries for this primary.
 Remove these zones (after the live check) instead of searching the log.
 .SH COMMANDS
 .TP
-.BR list " [" primary | secondary "] [" csv "]"
+.BR list " [" primary | secondary "] [" registrar "] [" csv "]"
 List all zones on this server: type, primary IPs (for secondary zones), whether the zone
 was added with rndc addzone or written into the config, and its delegation status. Ends
 with a count per primary. Changes nothing.
 .B csv
 gives comma-separated output for a spreadsheet.
+.B registrar
+also looks up the registrar of each domain: whois at the registry for .se, .nu and other
+country domains, RDAP for generic ones (.com, .net, ...). Results are cached for 30 days in
+/var/lib/dns-zone-cleanup/registrar.tsv, and new lookups are made one per second.
 .TP
 .B delegation
 Show the delegation check for all secondary and primary zones, change nothing. Lists
@@ -1565,7 +1571,7 @@ usage() {
     echo "               [--report-email a@b.se] [--report-time 07:00] [--report-always]"
     echo "               [--smtp smtps://host:465 --smtp-user user | --no-smtp-auth] [--smtp-tls require|try|off]"
     echo "               [--mail-from addr] [--primary-zones report|comment]"
-    echo "       $(basename "$0") list [primary|secondary] [csv]"
+    echo "       $(basename "$0") list [primary|secondary] [registrar] [csv]"
     echo "       $(basename "$0") report [--test|--print|--always]"
     echo "       $(basename "$0") check | update [--force] | status | uninstall | version"
     echo "       (yes = delete, no = keep)"
@@ -1586,6 +1592,7 @@ DELEG_SHOW=""
 LIST_SHOW=""
 LIST_TYPE=""
 LIST_CSV=""
+LIST_REG=""
 
 is_ip()     { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$1" =~ ^[0-9a-fA-F]*:[0-9a-fA-F:]+$ ]]; }
 row() { printf "%-40s %-9s %-10s %s\n" "$@"; }
@@ -1605,6 +1612,7 @@ for arg in "$@"; do
         primary|master)    LIST_TYPE="primary" ;;
         secondary|slave)   LIST_TYPE="secondary" ;;
         csv|--csv)    LIST_CSV=1 ;;
+        registrar|registrars|--registrar) LIST_REG=1 ;;
         -h|--help|help) usage ;;
         *)
             if is_ip "$a"; then
@@ -2292,17 +2300,145 @@ primary_scan() {
 
 PENDING_LIST=()
 
+# ---------------------------------------------------------------------------
+# Registrar lookup (for "list registrar")
+# ---------------------------------------------------------------------------
+REG_CACHE="$STATE_DIR/registrar.tsv"       # domain <TAB> registrar <TAB> looked up (epoch)
+REG_CACHE_DAYS=30
+declare -A REG_WHOIS_SERVER=() REG_CACHED=() REG_CACHED_TS=()
+REG_DIRTY=""
+
+# Ask a whois server (port 43) without needing the whois package
+whois_query() {
+    local server="$1" q="$2"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 15 bash -c 'exec 3<>"/dev/tcp/$1/43" || exit 1; printf "%s\r\n" "$2" >&3; cat <&3' _ "$server" "$q" 2>/dev/null
+    elif command -v whois >/dev/null 2>&1; then
+        whois -h "$server" "$q" 2>/dev/null
+    fi
+}
+
+# Look up the registry's whois server for a TLD at IANA, once per TLD (call it directly,
+# not in $(...), so the result is remembered)
+whois_server_lookup() {
+    local tld="$1"
+    [ -n "${REG_WHOIS_SERVER[$tld]+x}" ] && return 0
+    REG_WHOIS_SERVER[$tld]="$(whois_query whois.iana.org "$tld" | sed -nE 's/^whois:[[:space:]]+([^[:space:]]+).*/\1/p' | head -n1)"
+}
+
+# The registrar's name from RDAP (generic TLDs: .com, .net, .org, ...)
+registrar_rdap() {
+    local f="$TMPD/rdap.json"
+    rm -f "$f"
+    download "https://rdap.org/domain/$1" "$f" 2>/dev/null || return 1
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -I -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+for e in d.get("entities", []):
+    if "registrar" in e.get("roles", []):
+        for v in (e.get("vcardArray") or [None, []])[1]:
+            if v and v[0] == "fn": print(v[3]); sys.exit()' "$f" 2>/dev/null
+    elif command -v jq >/dev/null 2>&1; then
+        jq -r '[.entities[]? | select(.roles | index("registrar")) | .vcardArray[1][]? | select(.[0] == "fn") | .[3]][0] // empty' "$f" 2>/dev/null
+    fi
+}
+
+# The registrar's name from the registry's whois (.se, .nu and most other ccTLDs).
+# Prints "(not registered)" when the registry answers without a registrar.
+registrar_whois() {
+    local d="$1" srv="$2" out reg
+    [ -z "$srv" ] && return 1
+    out="$(whois_query "$srv" "$d" | tr -d '\r')"
+    [ -z "$out" ] && return 1
+    reg="$(sed -nE 's/^[[:space:]]*(Sponsoring )?[Rr]egistrar( [Nn]ame| [Hh]andle)?[ .]*:[[:space:]]*(.+)$/\3/p' <<<"$out" | head -n1)"
+    if [ -n "$reg" ]; then echo "$reg"
+    elif grep -qiE 'not found|no match|no entries|no data found|does not exist|not registered|available' <<<"$out"; then echo "(not registered)"
+    fi
+}
+
+# The registered domain of a zone: the last two labels (sub.example.se -> example.se)
+reg_domain() { awk -F. '{ if (NF > 2) print $(NF-1) "." $NF; else print }' <<<"$1"; }
+
+# Registrar of a zone's registered domain, from the cache or looked up (and cached).
+# Prints "-" for zones that aren't public domains (reverse zones, .local, ...).
+# True for zones that are not public domains (reverse zones, .local, ...): no lookup
+reg_skip() {
+    case "$1" in *.arpa|*.local|*.lan|*.internal|*.localhost|localhost|*.test|*.invalid|*.example|*.*.*.*.*) return 0 ;; esac
+    [[ "$1" == *.* ]] || return 0
+    return 1
+}
+
+registrar_of() {
+    local z="$1" d tld now reg
+    reg_skip "$z" && { echo "-"; return; }
+    d="$(reg_domain "$z")"
+    tld="${d##*.}"
+    now="$(date +%s)"
+    if [ -n "${REG_CACHED[$d]+x}" ] && [ $((now - ${REG_CACHED_TS[$d]:-0})) -lt $((REG_CACHE_DAYS * 86400)) ]; then
+        echo "${REG_CACHED[$d]}"; return
+    fi
+    sleep 1   # be gentle with the registries' whois/RDAP servers
+    reg=""
+    [ ${#tld} -gt 2 ] && reg="$(registrar_rdap "$d")"
+    if [ -z "$reg" ]; then
+        whois_server_lookup "$tld"
+        reg="$(registrar_whois "$d" "${REG_WHOIS_SERVER[$tld]}")"
+    fi
+    reg="$(printf '%s' "${reg:-?}" | tr -d '\t' | sed 's/[[:space:]]*$//')"
+    REG_CACHED[$d]="$reg"; REG_CACHED_TS[$d]="$now"; REG_DIRTY=1
+    echo "$reg"
+}
+
+reg_cache_load() {
+    local d reg ts
+    as_root test -f "$REG_CACHE" || return 0
+    while IFS=$'\t' read -r d reg ts; do
+        [ -n "$d" ] && { REG_CACHED["$d"]="$reg"; REG_CACHED_TS["$d"]="$ts"; }
+    done < <(as_root cat "$REG_CACHE" 2>/dev/null)
+}
+reg_cache_save() {
+    local d
+    [ -z "$REG_DIRTY" ] && return 0
+    as_root mkdir -p "$STATE_DIR" 2>/dev/null
+    for d in "${!REG_CACHED[@]}"; do
+        # failed lookups ("?") are not kept, so they are tried again next time
+        [ "${REG_CACHED[$d]}" == "?" ] || printf '%s\t%s\t%s\n' "$d" "${REG_CACHED[$d]}" "${REG_CACHED_TS[$d]}"
+    done | sort | as_root tee "$REG_CACHE" >/dev/null 2>&1 || true
+}
+
+# Names of the zones "list" will show (honours the primary/secondary filter)
+list_zone_names() {
+    zone_index | awk -F'\t' -v want="$LIST_TYPE" '{
+        t = $7; if (t == "master") t = "primary"; else if (t == "slave") t = "secondary"
+        if (want == "" || t == want) print $1 }' | sort -u
+}
+
 # All zones on this server, with type, primaries, origin and delegation status. Read-only.
 list_zones() {
-    local z f start src t prim origin deleg st since n_all=0 n_pri=0 n_sec=0 n_oth=0
-    declare -A DST=() DSINCE=() PCOUNT=()
+    local z d f start src t prim origin deleg st since reg todo n_all=0 n_pri=0 n_sec=0 n_oth=0
+    declare -A DST=() DSINCE=() PCOUNT=() RCOUNT=()
+    if [ -n "$LIST_REG" ]; then
+        reg_cache_load
+        # Registrar lookups run in a subshell per zone, so look them all up here first.
+        todo=0
+        while read -r d; do
+            [ -n "${REG_CACHED[$d]+x}" ] || todo=$((todo + 1))
+        done < <(list_zone_names | while read -r z; do reg_skip "$z" || reg_domain "$z"; done | sort -u)
+        [ "$todo" -gt 0 ] && echo "Looking up registrars ($todo not in the cache, about one per second)..." >&2
+        while read -r z; do
+            registrar_of "$z" > /dev/null
+        done < <(list_zone_names)
+        reg_cache_save
+    fi
     if as_root test -f "$DELEG_STATE"; then
         while IFS=$'\t' read -r z st since _; do
             [ -n "$z" ] && { DST["$z"]="$st"; DSINCE["$z"]="$since"; }
         done < <(as_root cat "$DELEG_STATE" 2>/dev/null)
     fi
     if [ -n "$LIST_CSV" ]; then
-        echo "zone,type,primaries,added_by,source,delegation"
+        echo "zone,type,primaries,added_by,source,delegation$([ -n "$LIST_REG" ] && echo ",registrar")"
+    elif [ -n "$LIST_REG" ]; then
+        printf "%-40s %-10s %-34s %-9s %-24s %s\n" "ZONE" "TYPE" "PRIMARIES" "ADDED" "DELEGATION" "REGISTRAR"
     else
         printf "%-40s %-10s %-34s %-9s %s\n" "ZONE" "TYPE" "PRIMARIES" "ADDED" "DELEGATION"
     fi
@@ -2320,8 +2456,17 @@ list_zones() {
             deleg="$deleg since $(date -d "@${DSINCE[$z]}" +%F 2>/dev/null || echo "${DSINCE[$z]}")"
         fi
         [ -z "$deleg" ] && deleg="-"
+        reg=""
+        if [ -n "$LIST_REG" ]; then
+            reg="$(registrar_of "$z")"     # from the cache filled above
+            [ "$reg" != "-" ] && RCOUNT["$reg"]=$(( ${RCOUNT["$reg"]:-0} + 1 ))
+        fi
         if [ -n "$LIST_CSV" ]; then
-            printf '%s,%s,%s,%s,%s:%s,%s\n' "$z" "$t" "$prim" "$origin" "$f" "$start" "$deleg"
+            printf '%s,%s,%s,%s,%s:%s,%s' "$z" "$t" "$prim" "$origin" "$f" "$start" "$deleg"
+            [ -n "$LIST_REG" ] && printf ',"%s"' "${reg//\"/}"
+            echo
+        elif [ -n "$LIST_REG" ]; then
+            printf "%-40s %-10s %-34s %-9s %-24s %s\n" "$z" "$t" "$prim" "$origin" "$deleg" "$reg"
         else
             printf "%-40s %-10s %-34s %-9s %s\n" "$z" "$t" "$prim" "$origin" "$deleg"
         fi
@@ -2334,6 +2479,10 @@ list_zones() {
     if [ ${#PCOUNT[@]} -gt 0 ]; then
         echo "Secondary zones per primary:"
         for ip in "${!PCOUNT[@]}"; do printf "  %6d  %s\n" "${PCOUNT[$ip]}" "$ip"; done | sort -rn
+    fi
+    if [ ${#RCOUNT[@]} -gt 0 ]; then
+        echo "Zones per registrar (? = lookup failed, tried again next time):"
+        for reg in "${!RCOUNT[@]}"; do printf "  %6d  %s\n" "${RCOUNT[$reg]}" "$reg"; done | sort -rn
     fi
     if ! command -v named-nzd2nzf >/dev/null 2>&1 && [ -n "$(as_root sh -c "ls -1 '$(bind_directory)'/*.nzd 2>/dev/null")" ]; then
         echo "Note: zones added with rndc addzone are in an .nzd file and named-nzd2nzf (part of BIND) is missing, so they are not listed."
