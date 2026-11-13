@@ -27,6 +27,9 @@
 #       Remove specific zone(s) directly
 #   dns-zone-cleanup delegation [ZONE...]
 #       Show the delegation check for all (or the given) secondary zones, change nothing
+#   dns-zone-cleanup list [primary|secondary] [csv]
+#       List all zones on this server: type, primary IPs, how they were added, delegation
+#       status, and a count per primary. Changes nothing.
 #
 #   delete|yes   Delete the zone file of a removed zone (default, see --delete-files)
 #   keep|no      Keep the zone file
@@ -114,7 +117,7 @@ log_event() {
 # Installation, updates and scheduling
 # ---------------------------------------------------------------------------
 
-VERSION="1.2.2"
+VERSION="1.3.0"
 REPO_RAW="${PSZC_REPO_RAW:-https://raw.githubusercontent.com/weconnect-tobias/Plesk-Scripts}"   # override only for testing
 REPO_API="${PSZC_REPO_API:-https://api.github.com/repos/weconnect-tobias/Plesk-Scripts}"
 TAG_PREFIX="dns-zone-cleanup-v"   # releases of this script are tagged dns-zone-cleanup-v1.2.3
@@ -1278,6 +1281,13 @@ Only look at log entries for this primary.
 Remove these zones (after the live check) instead of searching the log.
 .SH COMMANDS
 .TP
+.BR list " [" primary | secondary "] [" csv "]"
+List all zones on this server: type, primary IPs (for secondary zones), whether the zone
+was added with rndc addzone or written into the config, and its delegation status. Ends
+with a count per primary. Changes nothing.
+.B csv
+gives comma-separated output for a spreadsheet.
+.TP
 .B delegation
 Show the delegation check for all secondary and primary zones, change nothing. Lists
 only zones that are not OK; add
@@ -1555,6 +1565,7 @@ usage() {
     echo "               [--report-email a@b.se] [--report-time 07:00] [--report-always]"
     echo "               [--smtp smtps://host:465 --smtp-user user | --no-smtp-auth] [--smtp-tls require|try|off]"
     echo "               [--mail-from addr] [--primary-zones report|comment]"
+    echo "       $(basename "$0") list [primary|secondary] [csv]"
     echo "       $(basename "$0") report [--test|--print|--always]"
     echo "       $(basename "$0") check | update [--force] | status | uninstall | version"
     echo "       (yes = delete, no = keep)"
@@ -1572,6 +1583,9 @@ DRYRUN=""
 FORCE=""
 VERBOSE=""
 DELEG_SHOW=""
+LIST_SHOW=""
+LIST_TYPE=""
+LIST_CSV=""
 
 is_ip()     { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$1" =~ ^[0-9a-fA-F]*:[0-9a-fA-F:]+$ ]]; }
 row() { printf "%-40s %-9s %-10s %s\n" "$@"; }
@@ -1587,6 +1601,10 @@ for arg in "$@"; do
         force)        FORCE="force" ;;
         verbose|-v)   VERBOSE=1 ;;
         delegation)   DELEG_SHOW=1 ;;
+        list|zones)   LIST_SHOW=1 ;;
+        primary|master)    LIST_TYPE="primary" ;;
+        secondary|slave)   LIST_TYPE="secondary" ;;
+        csv|--csv)    LIST_CSV=1 ;;
         -h|--help|help) usage ;;
         *)
             if is_ip "$a"; then
@@ -1615,7 +1633,7 @@ fi
 
 # What to do with the zone file of a removed zone?
 if [ -z "$FILE_ACTION" ]; then
-    if [ -n "$DRYRUN" ] || [ -n "$DELEG_SHOW" ] || ! interactive; then
+    if [ -n "$DRYRUN" ] || [ -n "$DELEG_SHOW" ] || [ -n "$LIST_SHOW" ] || ! interactive; then
         FILE_ACTION="$FILES"          # from the settings file (default: delete)
     else
         read -r -p "Zone files of removed zones: delete, keep or archive? [default: $FILES]: " ans
@@ -1637,7 +1655,7 @@ trap 'rm -rf "$TMPD"' EXIT
 # What does this BIND support?
 # ---------------------------------------------------------------------------
 
-command -v dig >/dev/null 2>&1 || { echo "Error: 'dig' not found. Run: sudo $MARKER install (installs what is missing)"; exit 1; }
+[ -n "$LIST_SHOW" ] || command -v dig >/dev/null 2>&1 || { echo "Error: 'dig' not found. Run: sudo $MARKER install (installs what is missing)"; exit 1; }
 
 # rndc usable? (binary present, key readable, named answering)
 RNDC_OK=""
@@ -1669,7 +1687,7 @@ if [ -z "$RNDC_OK" ]; then
         echo "Error: rndc does not work and no named.conf was found - nothing can be done on this server."
         exit 1
     fi
-    echo "Note: rndc is not usable here. Only zones defined in named.conf files can be removed (BIND is reloaded via systemd/init)."
+    [ -n "$LIST_SHOW" ] || echo "Note: rndc is not usable here. Only zones defined in named.conf files can be removed (BIND is reloaded via systemd/init)."
 fi
 
 # Which rndc commands does this BIND know? (showzone: 9.11+, zonestatus: 9.10+)
@@ -2273,6 +2291,59 @@ primary_scan() {
 }
 
 PENDING_LIST=()
+
+# All zones on this server, with type, primaries, origin and delegation status. Read-only.
+list_zones() {
+    local z f start src t prim origin deleg st since n_all=0 n_pri=0 n_sec=0 n_oth=0
+    declare -A DST=() DSINCE=() PCOUNT=()
+    if as_root test -f "$DELEG_STATE"; then
+        while IFS=$'\t' read -r z st since _; do
+            [ -n "$z" ] && { DST["$z"]="$st"; DSINCE["$z"]="$since"; }
+        done < <(as_root cat "$DELEG_STATE" 2>/dev/null)
+    fi
+    if [ -n "$LIST_CSV" ]; then
+        echo "zone,type,primaries,added_by,source,delegation"
+    else
+        printf "%-40s %-10s %-34s %-9s %s\n" "ZONE" "TYPE" "PRIMARIES" "ADDED" "DELEGATION"
+    fi
+    while IFS=$'\t' read -r z f start _ _ src t; do
+        case "$t" in master) t="primary" ;; slave) t="secondary" ;; "") t="?" ;; esac
+        [ -n "$LIST_TYPE" ] && [ "$t" != "$LIST_TYPE" ] && continue
+        prim="-"
+        if [ "$t" == "secondary" ]; then
+            prim="$(primaries_of "$z")"; [ -z "$prim" ] && prim="?"
+            for ip in $prim; do PCOUNT["$ip"]=$(( ${PCOUNT["$ip"]:-0} + 1 )); done
+        fi
+        case "$src" in conf) origin="config" ;; nzf|nzd) origin="addzone" ;; *) origin="$src" ;; esac
+        deleg="${DST[$z]:-}"
+        if [ -n "$deleg" ] && [[ "${DSINCE[$z]:-}" =~ ^[0-9]+$ ]] && [ "$deleg" != "OK" ]; then
+            deleg="$deleg since $(date -d "@${DSINCE[$z]}" +%F 2>/dev/null || echo "${DSINCE[$z]}")"
+        fi
+        [ -z "$deleg" ] && deleg="-"
+        if [ -n "$LIST_CSV" ]; then
+            printf '%s,%s,%s,%s,%s:%s,%s\n' "$z" "$t" "$prim" "$origin" "$f" "$start" "$deleg"
+        else
+            printf "%-40s %-10s %-34s %-9s %s\n" "$z" "$t" "$prim" "$origin" "$deleg"
+        fi
+        n_all=$((n_all + 1))
+        case "$t" in primary) n_pri=$((n_pri + 1)) ;; secondary) n_sec=$((n_sec + 1)) ;; *) n_oth=$((n_oth + 1)) ;; esac
+    done < <(zone_index | sort -t$'\t' -k1,1 -u)
+    [ -n "$LIST_CSV" ] && return 0
+    echo
+    echo "$n_all zone(s): $n_sec secondary, $n_pri primary$([ "$n_oth" -gt 0 ] && echo ", $n_oth other (forward, stub, hint, ...)")."
+    if [ ${#PCOUNT[@]} -gt 0 ]; then
+        echo "Secondary zones per primary:"
+        for ip in "${!PCOUNT[@]}"; do printf "  %6d  %s\n" "${PCOUNT[$ip]}" "$ip"; done | sort -rn
+    fi
+    if ! command -v named-nzd2nzf >/dev/null 2>&1 && [ -n "$(as_root sh -c "ls -1 '$(bind_directory)'/*.nzd 2>/dev/null")" ]; then
+        echo "Note: zones added with rndc addzone are in an .nzd file and named-nzd2nzf (part of BIND) is missing, so they are not listed."
+    fi
+}
+
+if [ -n "$LIST_SHOW" ]; then
+    list_zones
+    exit 0
+fi
 
 if [ -n "$DELEG_SHOW" ]; then
     delegation_scan show

@@ -29,12 +29,12 @@ The manual page is part of the script itself. `install` writes it to `/usr/local
 
 A secondary zone is stale when:
 
-| Source | How it is found | What it means |
-|---|---|---|
-| **RETRY** | Log: `refresh: retry limit for primary <IP>#53 exceeded` | The primary does not answer for the zone at all |
-| **DISABLED** | Log: `refresh: unexpected rcode (REFUSED)` / `(NOTAUTH)`, or `refresh: non-authoritative answer` | The primary answers but no longer has the zone, e.g. DNS switched off for the domain |
-| **MOVED** | Delegation check: the domain's NS records at the TLD point to other nameservers only | The domain has moved to another DNS host. The old primary may still serve the zone, with outdated data. |
-| **UNREG** | Delegation check: the TLD says the domain does not exist | The domain has expired or been deleted |
+| Source       | How it is found                                                                                  | What it means                                                                                           |
+| ------------ | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| **RETRY**    | Log: `refresh: retry limit for primary <IP>#53 exceeded`                                         | The primary does not answer for the zone at all                                                         |
+| **DISABLED** | Log: `refresh: unexpected rcode (REFUSED)` / `(NOTAUTH)`, or `refresh: non-authoritative answer` | The primary answers but no longer has the zone, e.g. DNS switched off for the domain                    |
+| **MOVED**    | Delegation check: the domain's NS records at the TLD point to other nameservers only             | The domain has moved to another DNS host. The old primary may still serve the zone, with outdated data. |
+| **UNREG**    | Delegation check: the TLD says the domain does not exist                                         | The domain has expired or been deleted                                                                  |
 
 The log is named's log: `/var/log/syslog`, `/var/log/messages` or the systemd journal, plus the newest rotated file. Both `primary` (BIND 9.18+) and `master` (older BIND) are matched. By default every primary is looked at; give an IP address to only look at one.
 
@@ -88,13 +88,13 @@ Secondary zones are what dns-zone-cleanup cleans up; primary zones are only chec
 
 It does run a daily check of the primary zones. That catches the old-server case: a domain that has moved to another primary or DNS host, or has expired, while this server still serves its zone. A primary is usually not in the domain's NS records itself. So the script first compares the TLD's NS records with the NS records **in the zone**. When they differ, it compares the zone's SOA (primary name and serial) here with what the delegated nameservers serve:
 
-| Status | Meaning |
-|---|---|
-| `OURS` | The TLD delegates to the zone's own nameservers, to other names with the same addresses, or to nameservers that serve the same SOA serial (they get the zone from here) |
-| `MOVED` | The delegated nameservers serve a version from **another primary** (other name in the SOA), or a newer one. This server has a stale copy. |
-| `BEHIND` | The delegated nameservers have the same primary in their SOA but an **older** serial. They don't get updates from this server: are zone transfers or NOTIFY failing? |
-| `ELSEWHERE` | Delegated to other nameservers, but their SOA could not be read |
-| `UNREG` | The domain no longer exists at the TLD |
+| Status      | Meaning                                                                                                                                                                 |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OURS`      | The TLD delegates to the zone's own nameservers, to other names with the same addresses, or to nameservers that serve the same SOA serial (they get the zone from here) |
+| `MOVED`     | The delegated nameservers serve a version from **another primary** (other name in the SOA), or a newer one. This server has a stale copy.                               |
+| `BEHIND`    | The delegated nameservers have the same primary in their SOA but an **older** serial. They don't get updates from this server: are zone transfers or NOTIFY failing?    |
+| `ELSEWHERE` | Delegated to other nameservers, but their SOA could not be read                                                                                                         |
+| `UNREG`     | The domain no longer exists at the TLD                                                                                                                                  |
 
 The SOA details are shown and reported, for example `here: ns.example.net serial 2023070700 - at ns1.example.org: ns2.example.org serial 2026071502`. That tells you at a glance whether the zone has moved.
 
@@ -125,13 +125,13 @@ sudo dns-zone-cleanup install --exclude "example.se *.internal.example.se"
 
 For RETRY and DISABLED zones the log alone is not enough: log lines can be old, and the same domain can exist on more than one primary. So before anything is removed, the script reads the zone's **current** primaries from its config and checks **every** one of them live with `dig +norec SOA`:
 
-| Primary answers | Action |
-|---|---|
-| At least one primary answers authoritatively (`aa` flag) | Skip: the zone is active somewhere |
-| All primaries answer `REFUSED`, `NOTAUTH`, `NXDOMAIN`, or without the `aa` flag | Remove |
-| No primary answers (timeout) | Remove RETRY zones (the original behaviour); skip DISABLED and named zones, since a sudden timeout suggests a network problem (`force` overrides for named zones) |
-| Some say gone, others time out (`MIXED`) | Skip: can't be sure |
-| Anything else (e.g. `SERVFAIL`) | Skip: the zone exists on a primary but is broken there, check manually |
+| Primary answers                                                                 | Action                                                                                                                                                            |
+| ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| At least one primary answers authoritatively (`aa` flag)                        | Skip: the zone is active somewhere                                                                                                                                |
+| All primaries answer `REFUSED`, `NOTAUTH`, `NXDOMAIN`, or without the `aa` flag | Remove                                                                                                                                                            |
+| No primary answers (timeout)                                                    | Remove RETRY zones (the original behaviour); skip DISABLED and named zones, since a sudden timeout suggests a network problem (`force` overrides for named zones) |
+| Some say gone, others time out (`MIXED`)                                        | Skip: can't be sure                                                                                                                                               |
+| Anything else (e.g. `SERVFAIL`)                                                 | Skip: the zone exists on a primary but is broken there, check manually                                                                                            |
 
 When you give an IP address, a zone whose primaries no longer include that IP is skipped. That happens when the domain has been moved to another primary and the zone was re-added from there; the old log lines then refer to the wrong server.
 
@@ -153,19 +153,19 @@ In auto mode, zones whose primary can't be read from their config are skipped. Z
 
 How the zone is removed depends on how it was added:
 
-| The zone is... | What the script does |
-|---|---|
-| Added with `rndc addzone` (e.g. Plesk Slave DNS Manager) | `rndc delzone` |
-| Defined in `named.conf` or an included file (older setups, own sync scripts) | Comments out the zone statement with `# `, checks the config, reloads BIND (see below) |
-| Something that can't be done safely | Leaves it alone and reports it as **remove by hand**, in the output and in the mail report |
+| The zone is...                                                               | What the script does                                                                       |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Added with `rndc addzone` (e.g. Plesk Slave DNS Manager)                     | `rndc delzone`                                                                             |
+| Defined in `named.conf` or an included file (older setups, own sync scripts) | Comments out the zone statement with `#` , checks the config, reloads BIND (see below)     |
+| Something that can't be done safely                                          | Leaves it alone and reports it as **remove by hand**, in the output and in the mail report |
 
 What happens to the **zone file** is your choice (`install --delete-files`, `--keep-files` or `--archive-files`, or `delete`, `keep` or `archive` on the command line):
 
-| Setting | Zone file and `.jnl` journal |
-|---|---|
-| `delete` (default) | Deleted |
-| `keep` | Left where they are |
-| `archive` | Moved to `/var/backups/dns-zone-cleanup/<time>/zones/` |
+| Setting            | Zone file and `.jnl` journal                           |
+| ------------------ | ------------------------------------------------------ |
+| `delete` (default) | Deleted                                                |
+| `keep`             | Left where they are                                    |
+| `archive`          | Moved to `/var/backups/dns-zone-cleanup/<time>/zones/` |
 
 ### Zones in named.conf
 
@@ -197,13 +197,13 @@ Things to know:
 
 The script adapts to what the server has:
 
-| Missing | What happens instead |
-|---|---|
-| `rndc showzone` (BIND < 9.11) | The zone's primaries and file are read from `named.conf`, its includes and the `.nzf` file of `rndc addzone` |
-| `rndc zonestatus` (BIND < 9.10) | `dig @127.0.0.1` checks whether BIND still serves the zone |
-| `rndc delzone -clean` | `rndc delzone`, then the script handles the files itself |
-| A working `rndc` | Only zones in config files can be removed; BIND is reloaded via systemd/init. Zones added with `rndc addzone` are reported as remove by hand. |
-| `primaries` (BIND < 9.18 uses `masters`) | Both are understood, as are named lists (`masters plesk { 192.0.2.10; };`) |
+| Missing                                  | What happens instead                                                                                                                          |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rndc showzone` (BIND < 9.11)            | The zone's primaries and file are read from `named.conf`, its includes and the `.nzf` file of `rndc addzone`                                  |
+| `rndc zonestatus` (BIND < 9.10)          | `dig @127.0.0.1` checks whether BIND still serves the zone                                                                                    |
+| `rndc delzone -clean`                    | `rndc delzone`, then the script handles the files itself                                                                                      |
+| A working `rndc`                         | Only zones in config files can be removed; BIND is reloaded via systemd/init. Zones added with `rndc addzone` are reported as remove by hand. |
+| `primaries` (BIND < 9.18 uses `masters`) | Both are understood, as are named lists (`masters plesk { 192.0.2.10; };`)                                                                    |
 
 Large logs are no problem: the log is searched as a stream and only the refresh errors are kept, so memory use stays at a few MB however big `/var/log/syslog` is.
 
@@ -285,11 +285,11 @@ sudo dns-zone-cleanup install --report-email ops@example.com \
     --smtp smtp://relay.example.com:25 --no-smtp-auth --smtp-tls try --mail-from dns@example.com
 ```
 
-| `--smtp-tls` | Meaning |
-|---|---|
-| `require` (default) | Encrypted or nothing: STARTTLS on `smtp://`, TLS on `smtps://` |
-| `try` | STARTTLS if the server offers it, otherwise plain. Good for internal relays. |
-| `off` | Plain SMTP. Only allowed without a login, so a password is never sent unencrypted. |
+| `--smtp-tls`        | Meaning                                                                            |
+| ------------------- | ---------------------------------------------------------------------------------- |
+| `require` (default) | Encrypted or nothing: STARTTLS on `smtp://`, TLS on `smtps://`                     |
+| `try`               | STARTTLS if the server offers it, otherwise plain. Good for internal relays.       |
+| `off`               | Plain SMTP. Only allowed without a login, so a password is never sent unencrypted. |
 
 Give `--mail-from` with an address the relay accepts. Without a login there is no SMTP user to take it from.
 
@@ -306,16 +306,16 @@ sudo dns-zone-cleanup report --test     # send a test mail now
 sudo dns-zone-cleanup report --print    # show the next report without sending it
 ```
 
-| Option | Meaning |
-|---|---|
-| `--report-email a@example.com,b@example.com` | Where to send the report (comma separated) |
-| `--report-time 07:00` | When to send it (default 07:00) |
-| `--report-always` | Send a mail every day, also when nothing happened. A missing mail then tells you something is wrong. |
-| `--report-changes` | Back to only mailing when something happened (default) |
-| `--mail-from addr` | Sender. Default: the SMTP login if it is an address, otherwise `dns-zone-cleanup@<host>` |
-| `--smtp-user user` / `--no-smtp-auth` | Log in to the SMTP server / don't log in (relay that allows this server by IP) |
-| `--smtp-tls require\|try\|off` | Encryption, see above (default: require) |
-| `--no-report` / `--no-smtp` | Turn the report or the SMTP server off |
+| Option                                       | Meaning                                                                                              |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `--report-email a@example.com,b@example.com` | Where to send the report (comma separated)                                                           |
+| `--report-time 07:00`                        | When to send it (default 07:00)                                                                      |
+| `--report-always`                            | Send a mail every day, also when nothing happened. A missing mail then tells you something is wrong. |
+| `--report-changes`                           | Back to only mailing when something happened (default)                                               |
+| `--mail-from addr`                           | Sender. Default: the SMTP login if it is an address, otherwise `dns-zone-cleanup@<host>`             |
+| `--smtp-user user` / `--no-smtp-auth`        | Log in to the SMTP server / don't log in (relay that allows this server by IP)                       |
+| `--smtp-tls require\|try\|off`               | Encryption, see above (default: require)                                                             |
+| `--no-report` / `--no-smtp`                  | Turn the report or the SMTP server off                                                               |
 
 Example report:
 
@@ -348,13 +348,13 @@ To roll out a change: raise `VERSION` in the script and push to `main`. Servers 
 
 Before replacing anything, `update` checks that the downloaded file really is this script (shebang, name, `bash -n`). A failed download or a broken file leaves the current version in place. It never downgrades unless you add `--force`.
 
-GitHub releases work too, if you want them (see [Releases](../README.md#releases)):
+GitHub releases work too, if you want them (see Releases):
 
-| `--ref` | Looks at |
-|---|---|
-| `main` (default) | `VERSION` in the script on the main branch |
-| `latest` | The newest published release of this script (tag `dns-zone-cleanup-vX.Y.Z`). Releases of other scripts are ignored. |
-| `v1.0.0` | Only that release. Nothing changes until you pick another version with `install --ref`. |
+| `--ref`          | Looks at                                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `main` (default) | `VERSION` in the script on the main branch                                                                          |
+| `latest`         | The newest published release of this script (tag `dns-zone-cleanup-vX.Y.Z`). Releases of other scripts are ignored. |
+| `v1.0.0`         | Only that release. Nothing changes until you pick another version with `install --ref`.                             |
 
 ### Status and removal
 
@@ -377,6 +377,11 @@ dns-zone-cleanup archive                  # remove zones, move zone files to the
 dns-zone-cleanup dryrun verbose           # also list log zones that are already gone
 dns-zone-cleanup delegation                # show the delegation check, change nothing
 
+# List all zones on this server, change nothing
+dns-zone-cleanup list                      # all zones, with a count per primary
+dns-zone-cleanup list secondary            # only secondary zones (or: list primary)
+dns-zone-cleanup list csv > zones.csv      # comma-separated, for a spreadsheet
+
 # Only one primary
 dns-zone-cleanup 192.0.2.10 dryrun
 dns-zone-cleanup 192.0.2.10 delete
@@ -387,18 +392,45 @@ dns-zone-cleanup example.com example.net delete
 dns-zone-cleanup example.com delete force # remove even if the primary still serves it
 ```
 
-| Option | Meaning |
-|---|---|
+| Option                        | Meaning                                                                                                                                                                                   |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `delete` / `keep` / `archive` | What to do with the zone file (`yes` = delete, `no` = keep also work). If left out, the script asks; without a terminal or with `dryrun` it uses the installed setting (default: delete). |
-| `dryrun` | Only show what would be done, and how (`rndc delzone`, which lines are commented out where, what happens to the file). |
-| `verbose` | Also list zones from the log that are already gone. By default they are only counted. |
-| `force` | Zone mode only: remove the zone even if the primary still answers for it, e.g. when the domain is moving to another DNS. |
+| `dryrun`                      | Only show what would be done, and how (`rndc delzone`, which lines are commented out where, what happens to the file).                                                                    |
+| `verbose`                     | Also list zones from the log that are already gone. By default they are only counted.                                                                                                     |
+| `force`                       | Zone mode only: remove the zone even if the primary still answers for it, e.g. when the domain is moving to another DNS.                                                                  |
 
 Options can be given in any order. You can't mix an IP address and zone names in the same run.
 
 In zone mode the primary is read from the zone's config. If it can't be read, the zone is only removed with `force`. Zones this server is the primary for (`type master`/`primary`) are never touched, not even with `force`.
 
 After each removal the script checks that the zone is really gone from BIND. With `delete` it also checks that the zone file and its `.jnl` journal are gone, and deletes any file BIND left behind.
+
+### Listing zones
+
+`dns-zone-cleanup list` shows every zone BIND has configured: zones in `named.conf` and its include files, and zones added with `rndc addzone` (`.nzf`/`.nzd`). Zones commented out by an earlier cleanup are not listed. It doesn't need `dig` or a working `rndc`, and changes nothing.
+
+```
+ZONE                                     TYPE       PRIMARIES                          ADDED     DELEGATION
+example.se                               primary    -                                  config    -
+kund1.se                                 secondary  192.0.2.10                         addzone   -
+kund2.se                                 secondary  192.0.2.10 192.0.2.11              addzone   -
+moved.se                                 secondary  198.51.100.5                       addzone   MOVED since 2026-11-11
+
+4 zone(s): 3 secondary, 1 primary.
+Secondary zones per primary:
+       2  192.0.2.10
+       1  198.51.100.5
+       1  192.0.2.11
+```
+
+| Column       | Meaning                                                                                                                           |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `TYPE`       | `primary`, `secondary`, or another type such as `forward`                                                                         |
+| `PRIMARIES`  | The primary server(s) a secondary zone is transferred from. Named lists (`masters NAME { ... }`) are resolved to their addresses. |
+| `ADDED`      | `addzone` = added at runtime with `rndc addzone` (as Plesk's slave DNS manager does), `config` = written into a config file       |
+| `DELEGATION` | Status from the last delegation check, if the zone was not OK (`MOVED`, `UNREG`, ...)                                             |
+
+The count per primary at the end shows at a glance which servers feed this nameserver, and spots a primary that no longer exists. `csv` adds the source file and line of each zone.
 
 To read a different log file:
 
@@ -443,8 +475,7 @@ example.org                              RETRY     TIMEOUT    REMOVE
 
 - **No `rndc reload` needed** for zones added with `rndc addzone`. `rndc delzone` takes effect immediately.
 - **Run it on every secondary.** Each secondary has its own copy of the zones.
-- **Check the log format first.** If your secondaries log disabled zones with other wording, they won't be found in log mode:
-  `sudo grep -E "refresh: (unexpected rcode|non-authoritative)" /var/log/syslog | head`
+- **Check the log format first.** If your secondaries log disabled zones with other wording, they won't be found in log mode: `sudo grep -E "refresh: (unexpected rcode|non-authoritative)" /var/log/syslog | head`
 
 ## Moving from plesk-slave-zone-cleanup
 
